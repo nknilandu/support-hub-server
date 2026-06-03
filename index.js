@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const app = express();
 const port = process.env.PORT || 3021;
 const { MongoClient, ServerApiVersion } = require("mongodb");
@@ -25,6 +26,13 @@ app.get("/", (req, res) => {
   res.send("Successfully Connected to SupportHub");
 });
 
+const generateTicketNumber = () => {
+  const timePart = Date.now().toString(16).slice(-4).toUpperCase();
+  const randomPart = crypto.randomBytes(2).toString("hex").toUpperCase();
+
+  return `TCK-${timePart}${randomPart}`;
+};
+
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
@@ -35,6 +43,7 @@ async function run() {
     const DB = client.db("supportHub");
     const users = DB.collection("users");
     const companies = DB.collection("companies");
+    const tickets = DB.collection("tickets");
 
     // ================  Create users collections ===============
     app.post("/users", async (req, res) => {
@@ -131,6 +140,45 @@ async function run() {
         user,
       });
     });
+
+    // ================= CREATE TICKET =================
+
+    app.post("/tickets", async (req, res) => {
+      try {
+        const body = req.body;
+on
+        if (!body?.uid || !body?.email || !body?.aiResult) {
+          return res.status(400).send({
+            success: false,
+            message: "Required fields missing",
+          });
+        }
+        const ticketNumber = generateTicketNumber();
+        const ticket = {
+          ...body,
+          ticketNumber: ticketNumber,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await tickets.insertOne(ticket);
+
+        return res.status(201).send({
+          success: true,
+          message: "Ticket created successfully",
+          id: result.insertedId,
+          ticketId: result.ticketId,
+          ticketNumber: ticketNumber,
+        });
+      } catch (error) {
+        return res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+
+    // =================================
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
