@@ -295,6 +295,212 @@ async function run() {
       }
     });
 
+    // ============================================= customer dashboard =============================================
+
+    app.get(
+      "/dashboard/customer-overview",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const email = req.user.email;
+
+          // ==========================
+          // METRICS
+          // ==========================
+
+          const totalTickets = await tickets.countDocuments({
+            email,
+          });
+
+          const openTickets = await tickets.countDocuments({
+            email,
+            status: {
+              $regex: /^open$/i,
+            },
+          });
+
+          const pendingTickets = await tickets.countDocuments({
+            email,
+            status: {
+              $regex: /^pending$/i,
+            },
+          });
+
+          const resolvedTickets = await tickets.countDocuments({
+            email,
+            status: {
+              $regex: /^resolved$/i,
+            },
+          });
+
+          const aiResolved = await tickets.countDocuments({
+            email,
+            resolutionSource: {
+              $regex: /^ai$/i,
+            },
+          });
+
+          // ==========================
+          // STATUS CHART
+          // ==========================
+
+          const statusAggregation = await tickets
+            .aggregate([
+              {
+                $match: {
+                  email,
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    $toLower: "$status",
+                  },
+                  count: {
+                    $sum: 1,
+                  },
+                },
+              },
+            ])
+            .toArray();
+
+          const statusChart = {
+            open: 0,
+            pending: 0,
+            resolved: 0,
+          };
+
+          statusAggregation.forEach((item) => {
+            statusChart[item._id] = item.count;
+          });
+
+          // ==========================
+          // ACTIVITY CHART (LAST 7 DAYS)
+          // ==========================
+
+          const sevenDaysAgo = new Date();
+          sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+
+          const activityAggregation = await tickets
+            .aggregate([
+              {
+                $match: {
+                  email,
+                  createdAt: {
+                    $gte: sevenDaysAgo,
+                  },
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    $dateToString: {
+                      format: "%Y-%m-%d",
+                      date: "$createdAt",
+                    },
+                  },
+                  count: {
+                    $sum: 1,
+                  },
+                },
+              },
+              {
+                $sort: {
+                  _id: 1,
+                },
+              },
+            ])
+            .toArray();
+
+          const activityChart = [];
+
+          for (let i = 6; i >= 0; i--) {
+            const date = new Date();
+            date.setDate(date.getDate() - i);
+
+            const dateString = date.toISOString().split("T")[0];
+
+            const found = activityAggregation.find(
+              (item) => item._id === dateString,
+            );
+
+            activityChart.push({
+              day: date.toLocaleDateString("en-US", {
+                weekday: "short",
+              }),
+              count: found?.count || 0,
+            });
+          }
+
+          // ==========================
+          // RECENT TICKETS
+          // ==========================
+
+          const recentTickets = await tickets
+            .find({
+              email,
+            })
+            .sort({
+              createdAt: -1,
+            })
+            .limit(3)
+            .project({
+              ticketNumber: 1,
+              status: 1,
+              updatedAt: 1,
+              "aiResult.ticketTitle": 1,
+              "aiResult.states": 1,
+              "aiResult.summary": 1,
+              "aiResult.category": 1,
+            })
+            .toArray();
+
+          // ==========================
+          // INSIGHTS
+          // ==========================
+
+          const resolutionRate =
+            totalTickets > 0
+              ? Math.round((resolvedTickets / totalTickets) * 100)
+              : 0;
+
+          // ==========================
+          // RESPONSE
+          // ==========================
+
+          return res.send({
+            success: true,
+
+            metrics: {
+              totalTickets,
+              openTickets,
+              pendingTickets,
+              resolvedTickets,
+              aiResolved,
+            },
+
+            statusChart,
+
+            activityChart,
+
+            recentTickets,
+
+            insights: {
+              resolutionRate,
+              aiResolved,
+            },
+          });
+        } catch (error) {
+          return res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+
+    // ============================================= ================== =============================================
+
     // =================================
 
     // Send a ping to confirm a successful connection
