@@ -215,7 +215,14 @@ async function run() {
 
     app.get("/tickets/my-tickets", verifyFirebaseToken, async (req, res) => {
       try {
-        const { search, status, priority, category } = req.query;
+        const {
+          search,
+          status,
+          priority,
+          category,
+          page = 1,
+          limit = 10,
+        } = req.query;
 
         const query = {
           email: req.user.email,
@@ -240,13 +247,16 @@ async function run() {
         }
         // Status
         if (status) {
-          query.status = status;
+          query.status = {
+            $regex: new RegExp(`^${status}$`, "i"),
+          };
         }
         // Category
         if (category) {
-          query["aiResult.category"] = category;
+          query["aiResult.category"] = {
+            $regex: new RegExp(`^${category}$`, "i"),
+          };
         }
-
         // Priority
         if (priority) {
           query["aiResult.states"] = {
@@ -257,15 +267,25 @@ async function run() {
           };
         }
 
+        const skip = (Number(page) - 1) * Number(limit);
+        const total = await tickets.countDocuments(query);
+
         const result = await tickets
           .find(query)
           .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(Number(limit))
           .toArray();
 
         return res.send({
           success: true,
-          count: result.length,
           data: result,
+          pagination: {
+            total,
+            page: Number(page),
+            limit: Number(limit),
+            totalPages: Math.ceil(total / limit),
+          },
         });
       } catch (error) {
         return res.status(500).send({
