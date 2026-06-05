@@ -77,6 +77,34 @@ async function run() {
     const users = DB.collection("users");
     const companies = DB.collection("companies");
     const tickets = DB.collection("tickets");
+    const notifications = DB.collection("notifications");
+
+    // ============= notification function ==================
+    const createNotification = async ({
+      uid,
+      userEmail,
+      title,
+      message,
+      type,
+      ticketId = null,
+      ticketNumber = null,
+      path = "/",
+      readAt,
+    }) => {
+      await notifications.insertOne({
+        uid,
+        userEmail,
+        title,
+        message,
+        type,
+        ticketId,
+        ticketNumber,
+        path,
+        isRead: false,
+        readAt: null,
+        createdAt: new Date(),
+      });
+    };
 
     // ================  Create users collections ===============
     app.post("/users", async (req, res) => {
@@ -178,9 +206,9 @@ async function run() {
 
     app.post("/tickets", verifyFirebaseToken, async (req, res) => {
       try {
-        const body = req.body;
+        const bodyData = req.body;
 
-        if (!body?.uid || !body?.email || !body?.aiResult) {
+        if (!bodyData?.uid || !bodyData?.email || !bodyData?.aiResult) {
           return res.status(400).send({
             success: false,
             message: "Required fields missing",
@@ -188,7 +216,7 @@ async function run() {
         }
         const ticketNumber = generateTicketNumber();
         const ticket = {
-          ...body,
+          ...bodyData,
           ticketNumber: ticketNumber,
           createdAt: new Date(),
           updatedAt: new Date(),
@@ -196,11 +224,28 @@ async function run() {
 
         const result = await tickets.insertOne(ticket);
 
+        // ======== create notification ============
+        try {
+
+          await createNotification({
+            uid: bodyData.uid,
+            userEmail: bodyData.email,
+            title: "Ticket Created Successfully",
+            message: `Your ticket ${ticketNumber} has been created. Our team will review it shortly.`,
+            type: "ticket_created",
+            ticketId: result.insertedId,
+            ticketNumber: ticketNumber,
+            path: "/customer/my-tickets",
+          });
+        } catch (notifyErr) {
+          console.error("Notification error:", notifyErr.message);
+        }
+        // ============
+
         return res.status(201).send({
           success: true,
           message: "Ticket created successfully",
           id: result.insertedId,
-          ticketId: result.ticketId,
           ticketNumber: ticketNumber,
         });
       } catch (error) {
@@ -419,7 +464,6 @@ async function run() {
             date.setDate(date.getDate() - i);
 
             const dateString = date.toISOString().split("T")[0];
-
             const found = activityAggregation.find(
               (item) => item._id === dateString,
             );
@@ -435,7 +479,6 @@ async function run() {
           // ==========================
           // RECENT TICKETS
           // ==========================
-
           const recentTickets = await tickets
             .find({
               email,
@@ -458,19 +501,15 @@ async function run() {
           // ==========================
           // INSIGHTS
           // ==========================
-
           const resolutionRate =
             totalTickets > 0
               ? Math.round((resolvedTickets / totalTickets) * 100)
               : 0;
-
           // ==========================
           // RESPONSE
           // ==========================
-
           return res.send({
             success: true,
-
             metrics: {
               totalTickets,
               openTickets,
@@ -478,13 +517,9 @@ async function run() {
               resolvedTickets,
               aiResolved,
             },
-
             statusChart,
-
             activityChart,
-
             recentTickets,
-
             insights: {
               resolutionRate,
               aiResolved,
@@ -500,6 +535,98 @@ async function run() {
     );
 
     // ============================================= ================== =============================================
+
+    //  ============ notification ==============
+    app.get("/notifications", verifyFirebaseToken, async (req, res) => {
+      try {
+        const uid = req.user.uid;
+
+        const limit = parseInt(req.query.limit) || 20;
+
+        const data = await notifications
+          .find({ uid })
+          .sort({ createdAt: -1 })
+          .limit(limit)
+          .toArray();
+
+        const unreadCount = await notifications.countDocuments({
+          uid,
+          isRead: false,
+        });
+
+        return res.send({
+          success: true,
+          unreadCount,
+          notifications: data,
+        });
+      } catch (error) {
+        return res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+
+    // ============== PATCH /notifications/:id ====================
+    app.patch("/notifications/:id", verifyFirebaseToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        const result = await notifications.updateOne(
+          {
+            _id: new ObjectId(id),
+            userEmail: req.user.email,
+          },
+          {
+            $set: {
+              isRead: true,
+              readAt: new Date(),
+            },
+          },
+        );
+
+        return res.send({
+          success: true,
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        return res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+    // ================ PATCH /notifications/read-all =================
+    app.patch(
+      "/notifications/read-all",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const result = await notifications.updateMany(
+            {
+              userEmail: req.user.email,
+              isRead: false,
+            },
+            {
+              $set: {
+                isRead: true,
+                readAt: new Date(),
+              },
+            },
+          );
+
+          return res.send({
+            success: true,
+            modifiedCount: result.modifiedCount,
+          });
+        } catch (error) {
+          return res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
 
     // =================================
 
