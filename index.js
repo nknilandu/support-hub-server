@@ -173,17 +173,9 @@ async function run() {
       res.send(result);
     });
 
-    // ================ Get user role ===============
-    app.get("/users/role", async (req, res) => {
-      const email = req.query.email;
-
-      if (!email) {
-        return res.status(400).send({
-          success: false,
-          message: "Email is required",
-          role: null,
-        });
-      }
+    // ================ Get user info ===============
+    app.get("/users/me", verifyFirebaseToken, async (req, res) => {
+      const email = req.user.email;
 
       const user = await users.findOne({ email });
 
@@ -191,15 +183,93 @@ async function run() {
         return res.status(404).send({
           success: false,
           message: "User not found",
-          role: null,
         });
       }
-
       res.send({
         success: true,
-        role: user.role,
         user,
       });
+    });
+
+    // ================ UPDATE MY PROFILE ===============
+    app.patch("/users/me", verifyFirebaseToken, async (req, res) => {
+      try {
+        const email = req.user.email;
+        const updateDoc = {};
+
+        const { displayName, phone, location, language, timezone, photoURL } =
+          req.body;
+
+        if (typeof displayName === "string" && displayName.trim()) {
+          updateDoc.displayName = displayName.trim();
+        }
+
+        if (typeof phone === "string" && phone.trim()) {
+          updateDoc.phone = phone.trim();
+        }
+
+        if (typeof location === "string" && location.trim()) {
+          updateDoc.location = location.trim();
+        }
+
+        if (typeof language === "string" && language.trim()) {
+          updateDoc.language = language.trim();
+        }
+
+        if (typeof timezone === "string" && timezone.trim()) {
+          updateDoc.timezone = timezone.trim();
+        }
+
+        if (typeof photoURL === "string" && photoURL.trim()) {
+          updateDoc.photoURL = photoURL.trim();
+        }
+
+        // No valid field found
+        if (Object.keys(updateDoc).length === 0) {
+          return res.status(400).send({
+            success: false,
+            message: "No valid data provided",
+          });
+        }
+
+        updateDoc.updatedAt = new Date();
+
+        const result = await users.updateOne(
+          { email },
+          {
+            $set: updateDoc,
+          },
+        );
+
+        // ======== create notification ============
+        if (result.modifiedCount > 0) {
+          try {
+            await createNotification({
+              uid: req.user.uid,
+              userEmail: email,
+              title: "Profile Updated",
+              message:
+                "Your profile information has been updated successfully.",
+              type: "profile_updated",
+              path: "/profile",
+            });
+          } catch (notifyErr) {
+            console.error("Profile notification error:", notifyErr.message);
+          }
+        }
+        // =========================================
+
+        return res.send({
+          success: true,
+          message: "Profile updated successfully",
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        return res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
     });
 
     // ================= CREATE TICKET =================
@@ -226,7 +296,6 @@ async function run() {
 
         // ======== create notification ============
         try {
-
           await createNotification({
             uid: bodyData.uid,
             userEmail: bodyData.email,
