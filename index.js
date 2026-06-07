@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const app = express();
 const port = process.env.PORT || 3021;
 const { MongoClient, ServerApiVersion } = require("mongodb");
+const { analyzeTicket } = require("./ai-agents");
 require("dotenv").config();
 
 // middleware
@@ -51,10 +52,9 @@ const verifyFirebaseToken = async (req, res, next) => {
 };
 
 // ======================== mongodb connection ============================
-const uri =
-  `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster-support-hub.idvmsjp.mongodb.net/?appName=Cluster-Support-Hub`;
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster-support-hub.idvmsjp.mongodb.net/?appName=Cluster-Support-Hub`;
 
-  console.log(uri)
+console.log(uri);
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
@@ -700,6 +700,36 @@ async function run() {
       },
     );
 
+    // ================= AI ANALYZE TICKET =================
+    app.post("/ai/analyze-ticket", verifyFirebaseToken, async (req, res) => {
+      try {
+        const { description, attachments } = req.body;
+
+        if (!description) {
+          return res.status(400).send({
+            success: false,
+            message: "description is required",
+          });
+        }
+
+        const result = await analyzeTicket({
+          description,
+          imageUrls: attachments,
+        });
+
+        return res.status(200).send({
+          success: true,
+          data: result,
+        });
+      } catch (error) {
+        console.error("AI error:", error.message);
+
+        return res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
     // =================================
 
     // Send a ping to confirm a successful connection

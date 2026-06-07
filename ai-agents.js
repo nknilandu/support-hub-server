@@ -268,27 +268,22 @@ async function analyzeTicket({ description, imageUrls = [] }) {
 
   const raw = completion.choices[0].message.content;
 
-  try {
-    return safeParse(raw);
-  } catch (err) {
-    console.error("JSON Parse Failed:", raw);
-
-    return {
-      error: true,
-      message: "AI returned invalid JSON",
-      raw,
-    };
-  }
+  return safeParse(raw);
 }
 
 /* ---------------- RUN TEST ---------------- */
 async function run() {
   const result = await analyzeTicket({
     description: "Cannot access here",
-    imageUrls: ["https://uploads-eu-west-1.insided.com/typeform-en/attachment/f551cae4-36a9-4a10-b30c-459030a5b9f5.png"],
+    imageUrls: [
+      "https://uploads-eu-west-1.insided.com/typeform-en/attachment/f551cae4-36a9-4a10-b30c-459030a5b9f5.png",
+    ],
   });
 
   console.log(JSON.stringify(result, null, 2));
 }
+// run();
 
-run();
+// ---------------------------------------------
+
+module.exports = { analyzeTicket };
