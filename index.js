@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const app = express();
 const port = process.env.PORT || 3021;
 const { MongoClient, ServerApiVersion } = require("mongodb");
+require("dotenv").config();
 
 // middleware
 app.use(cors());
@@ -52,6 +53,8 @@ const verifyFirebaseToken = async (req, res, next) => {
 // ======================== mongodb connection ============================
 const uri =
   `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster-support-hub.idvmsjp.mongodb.net/?appName=Cluster-Support-Hub`;
+
+  console.log(uri)
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
