@@ -6,139 +6,289 @@ const openai = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY,
 });
 
-async function main() {
+/* ---------------- CLEAN JSON ---------------- */
+function cleanJson(text) {
+  return text
+    .replace(/```json/g, "")
+    .replace(/```/g, "")
+    .trim();
+}
+
+/* ---------------- SAFE PARSER ---------------- */
+function safeParse(raw) {
   try {
-    console.log("Starting...");
-    console.log("Model:", process.env.OPENROUTER_AI_MODEL);
-    console.log("Key exists:", !!process.env.OPENROUTER_API_KEY);
+    return JSON.parse(cleanJson(raw));
+  } catch {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
 
-    const systemPrompt = `
-You are a strict AI ticket analysis engine.
+    if (start === -1 || end === -1 || end <= start) {
+      throw new Error("Invalid JSON structure");
+    }
 
-OUTPUT RULES (VERY IMPORTANT):
-- Output ONLY valid JSON
-- No markdown, no explanations, no extra text
-- Must strictly follow schema
+    const jsonStr = raw.slice(start, end + 1);
 
-SCHEMA:
+    try {
+      return JSON.parse(jsonStr);
+    } catch {
+      throw new Error("Corrupted JSON from AI");
+    }
+  }
+}
+
+/* ---------------- MODEL GUARD ---------------- */
+function supportsVision(model) {
+  if (!model) return false;
+  return model.includes("vision") || model.includes("gpt-4");
+}
+
+/* ---------------- SYSTEM PROMPT ---------------- */
+const SYSTEM_PROMPT = `You are an enterprise AI support ticket analyzer.
+
+Your job is to analyze a user support ticket using:
+- text description (mandatory)
+- optional screenshots (imageUrls, max 3)
+
+You must produce a strict structured JSON response.
+
+========================================================
+INPUT FORMAT
+========================================================
+{
+  "description": "string",
+  "imageUrls": ["string"] // optional, max 3
+}
+
+========================================================
+STRICT RULES
+========================================================
+
+1. description is mandatory. If missing → fail logically.
+2. imageUrls is optional (max 3 images only).
+3. NEVER include any text outside JSON.
+4. NEVER use markdown.
+5. NEVER hallucinate image content.
+6. Output must be valid JSON only.
+7. No duplicate recommendations.
+8. rootCause must be 5–10 sentences.
+
+========================================================
+VISUAL ANALYSIS RULES (IF IMAGES EXIST)
+========================================================
+
+If imageUrls exist:
+
+- Analyze screenshots carefully.
+- Extract ONLY visible:
+  - errors
+  - warnings
+  - UI states
+  - authentication issues
+  - error codes
+  - system messages
+
+Populate:
+- visualEvidence array
+- visualConfidence (0–100)
+- visualInsights object
+
+visualConfidence meaning:
+0–39   = weak evidence
+40–59  = moderate evidence
+60–79  = strong evidence
+80–100 = highly reliable evidence
+
+If NO images provided:
+
+- visualEvidence = []
+- visualConfidence = null
+- visualInsights must be:
 
 {
-  "ticketTitle": string,
-  "summary": string,
+  "detectedErrors": 0,
+  "detectedWarnings": 0,
+  "affectedComponents": []
+}
+
+========================================================
+CONFIDENCE / PRIORITY / RISK RULES
+========================================================
+
+Confidence Score:
+- value must include "%"
+- 0–39 = red
+- 40–59 = orange
+- 60–79 = yellow
+- 80–100 = green
+
+Priority:
+Low = green
+Medium = yellow
+High = orange
+Critical = red
+
+Risk Level:
+Low = green
+Medium = yellow
+High = orange
+Critical = red
+
+========================================================
+OUTPUT SCHEMA (MUST FOLLOW EXACTLY)
+========================================================
+
+{
+  "ticketTitle": "string",
+  "summary": "string",
   "category": "Technical | Billing | Account | Bug | Feature | General",
-  "rootCause": string,
+
+  "rootCause": "string",
+
+  "visualEvidence": ["string"],
+
+  "visualInsights": {
+    "detectedErrors": 0,
+    "detectedWarnings": 0,
+    "affectedComponents": []
+  },
+
+  "visualConfidence": 91,
 
   "metrics": [
-    { "label": string, "value": string }
+    {
+      "label": "string",
+      "value": "string"
+    }
   ],
 
   "states": [
     {
-      "title": "Confidence Score | Priority | Risk Level",
-      "value": string,
-      "description": string,
-      "variant": "green | yellow | orange | red"
+      "title": "Confidence Score",
+      "value": "87%",
+      "description": "string",
+      "variant": "green"
+    },
+    {
+      "title": "Priority",
+      "value": "High",
+      "description": "string",
+      "variant": "orange"
+    },
+    {
+      "title": "Risk Level",
+      "value": "Low",
+      "description": "string",
+      "variant": "green"
     }
   ],
 
   "recommendations": [
     {
-      "title": string,
+      "title": "string",
       "impact": "Low | Medium | High",
       "variant": "green | orange | red",
-      "description": string
+      "description": "string"
     }
   ],
 
   "steps": [
     {
-      "id": number,
-      "title": string,
-      "description": string,
+      "id": 1,
+      "title": "string",
+      "description": "string",
       "impact": "Low | Medium | High",
-      "estimatedTime": string
+      "estimatedTime": "string"
     }
   ],
 
   "escalation": {
-    "recommended": boolean,
-    "reason": string,
-    "confidence": number
+    "recommended": false,
+    "reason": "string",
+    "confidence": 92
   }
 }
 
-STRICT BUSINESS RULES:
+========================================================
+FINAL OUTPUT RULE
+========================================================
 
-1. states array MUST ALWAYS contain exactly 3 objects:
-   - Confidence Score
-   - Priority
-   - Risk Level
+Return ONLY valid JSON.
+No markdown.
+No explanation.
+No extra fields.
+Must match schema exactly.`;
 
-2. Confidence Score rules:
-   - value must include "%"
-   - variant based on value:
-     0–39 = red
-     40–59 = orange
-     60–79 = yellow
-     80–100 = green
+/* ---------------- MAIN FUNCTION ---------------- */
+async function analyzeTicket({ description, imageUrls = [] }) {
+  if (!description) {
+    throw new Error("description is required");
+  }
 
-3. Priority mapping:
-   Low = green
-   Medium = yellow
-   High = orange
-   Critical = red
+  const model = process.env.OPENROUTER_AI_MODEL;
 
-4. Risk Level mapping:
-   Low = green
-   Medium = yellow
-   High = orange
-   Critical = red
+  const safeImages = Array.isArray(imageUrls)
+    ? imageUrls
+        .filter((u) => typeof u === "string" && u.startsWith("http"))
+        .slice(0, 3)
+    : [];
 
-5. escalation MUST ALWAYS include:
-   - recommended (boolean)
-   - reason (string)
-   - confidence (number 0–100)
+  // vision fallback safety
+  if (!supportsVision(model)) {
+    safeImages.length = 0;
+  }
 
-6. rootCause must be 5–10 sentences
+  const content = [
+    {
+      type: "text",
+      text: `User Issue:\n${description}`,
+    },
+  ];
 
-7. No duplicate recommendation titles
-
-Be precise. No hallucination. Follow schema strictly.
-`;
-
-    const userInput = `
-Ticket: Unable to connect Slack integration after workspace update.
-User reports integration stopped syncing and authentication keeps failing.
-`;
-
-    const completion = await openai.chat.completions.create({
-      model: process.env.OPENROUTER_AI_MODEL,
-      temperature: 0.2,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userInput },
-      ],
+  safeImages.forEach((url) => {
+    content.push({
+      type: "image_url",
+      image_url: { url },
     });
+  });
 
-    console.log("Completed");
+  const completion = await openai.chat.completions.create({
+    model,
+    temperature: 0.2,
+    messages: [
+      {
+        role: "system",
+        content: SYSTEM_PROMPT,
+      },
+      {
+        role: "user",
+        content,
+      },
+    ],
+  });
 
-    const raw = completion.choices[0].message.content;
+  const raw = completion.choices[0].message.content;
 
-    // Safe JSON parsing (important)
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (err) {
-      console.error("Invalid JSON returned from model:");
-      console.log(raw);
-      return;
-    }
+  try {
+    return safeParse(raw);
+  } catch (err) {
+    console.error("JSON Parse Failed:", raw);
 
-    console.log("Parsed Result:");
-    console.dir(parsed, { depth: null });
-  } catch (error) {
-    console.error("Error:", error.message);
+    return {
+      error: true,
+      message: "AI returned invalid JSON",
+      raw,
+    };
   }
 }
 
-main();
+/* ---------------- RUN TEST ---------------- */
+async function run() {
+  const result = await analyzeTicket({
+    description: "Cannot access here",
+    imageUrls: ["https://uploads-eu-west-1.insided.com/typeform-en/attachment/f551cae4-36a9-4a10-b30c-459030a5b9f5.png"],
+  });
+
+  console.log(JSON.stringify(result, null, 2));
+}
+
+run();
