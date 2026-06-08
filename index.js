@@ -712,6 +712,8 @@ async function run() {
           });
         }
 
+        // console.log("index: ", attachments, description)
+
         const result = await analyzeTicket({
           description,
           imageUrls: attachments,
