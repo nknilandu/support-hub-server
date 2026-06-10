@@ -716,7 +716,7 @@ async function run() {
 
         const result = await analyzeTicket({
           description,
-          imageUrls: attachments,
+          // imageUrls: attachments,  // uncomment it after upgrading model
         });
 
         return res.status(200).send({
