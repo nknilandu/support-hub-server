@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const app = express();
 const port = process.env.PORT || 3021;
 const { MongoClient, ServerApiVersion } = require("mongodb");
-const { analyzeTicket } = require("./ai-agents");
+const { analyzeTicket, chatWithAssistant } = require("./ai-agents");
 require("dotenv").config();
 
 // middleware
@@ -81,6 +81,9 @@ async function run() {
     const companies = DB.collection("companies");
     const tickets = DB.collection("tickets");
     const notifications = DB.collection("notifications");
+    const aiConversations = DB.collection("aiConversations");
+    const aiMessages = DB.collection("aiMessages");
+    const aiUsage = DB.collection("aiUsage");
 
     // ============= notification function ==================
     const createNotification = async ({
@@ -700,7 +703,7 @@ async function run() {
       },
     );
 
-    // ================= AI ANALYZE TICKET =================
+    // ====================== AI ANALYZE TICKET =============================
     app.post("/ai/analyze-ticket", verifyFirebaseToken, async (req, res) => {
       try {
         const { description, attachments } = req.body;
@@ -732,7 +735,139 @@ async function run() {
         });
       }
     });
-    // =================================
+
+    // ======================== AI CHAT-BOT ASSISTANT =============================
+    app.post("/ai/chat", verifyFirebaseToken, async (req, res) => {
+      try {
+        const { message, conversationId, conversationHistory } = req.body;
+        const uid = req.user.uid;
+
+        if (!message) {
+          return res.status(400).send({
+            success: false,
+            message: "message is required",
+          });
+        }
+
+        if (!uid) {
+          return res.status(400).send({
+            success: false,
+            message: "Uid not found",
+          });
+        }
+
+        const user = await users.findOne({ uid });
+
+        if (!user) {
+          return res.status(404).send({
+            success: false,
+            message: "User not found",
+          });
+        }
+        const userContext = { user };
+
+        // ===== create or load conversation =====
+        let conversation;
+        let conversationObjectId;
+
+        // ===== create or load conversation =====
+        if (!conversationId) {
+          const insertResult = await aiConversations.insertOne({
+            uid: uid,
+            preview: message.slice(0, 80),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          });
+
+          conversationObjectId = insertResult.insertedId;
+
+          conversation = {
+            _id: conversationObjectId,
+          };
+        } else {
+          conversationObjectId = new ObjectId(conversationId);
+
+          conversation = await aiConversations.findOne({
+            _id: conversationObjectId,
+            uid: uid,
+          });
+
+          // fallback create
+          if (!conversation) {
+            const insertResult = await aiConversations.insertOne({
+              uid: uid,
+              preview: message.slice(0, 80),
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            });
+
+            conversationObjectId = insertResult.insertedId;
+
+            conversation = {
+              _id: conversationObjectId,
+            };
+          }
+        }
+
+        // ===== fetch history =====
+        const historyDocs = await aiMessages
+          .find({ conversationId: conversation._id })
+          .sort({ createdAt: 1 }) // ascending
+          .limit(10)
+          .toArray();
+
+        const history = historyDocs.map((m) => ({
+          role: m.sender === "ai" ? "assistant" : "user",
+          content: m.message,
+        }));
+
+        // ===== AI CALL =====
+        const result = await chatWithAssistant({
+          message,
+          history,
+          userContext,
+        });
+
+        // ===== SAVE MESSAGES =====
+        await aiMessages.insertMany([
+          {
+            conversationId: conversation._id,
+            sender: "user",
+            message,
+            createdAt: new Date(),
+          },
+          {
+            conversationId: conversation._id,
+            sender: "ai",
+            message: result.reply,
+            meta: {
+              mode: result.mode,
+              intent: result.intent,
+              severity: result.severity,
+              tokensUsed: result.meta.tokensUsed,
+              model: result.meta.model,
+            },
+            createdAt: new Date(),
+          },
+        ]);
+
+        // ==================
+
+        return res.send({
+          success: true,
+          data: result,
+        });
+      } catch (error) {
+        console.error("AI Chat Error:", error);
+
+        return res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+
+    // ==============================================
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });

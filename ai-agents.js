@@ -331,5 +331,332 @@ async function run() {
 // run();
 
 // ---------------------------------------------
+// ---------------------------------------------
 
-module.exports = { analyzeTicket };
+async function chatWithAssistant({ message, history, userContext }) {
+  if (!message?.trim()) {
+    throw new Error("message is required");
+  }
+  if (!userContext) {
+    throw new Error("user information is required");
+  }
+
+  const model = process.env.OPENROUTER_AI_MODEL;
+  const MAX_HISTORY = 10;
+
+  // ===== Slim User Context =====
+  const slimUserContext = {
+    displayName: userContext?.user?.displayName || null,
+    role: userContext?.user?.role || "customer",
+  };
+
+  // ===== Compact Prompt =====
+  const SYSTEM_PROMPT = `
+You are SupportHub AI Assistant.
+
+User Context:
+${JSON.stringify(slimUserContext)}
+
+Rules:
+- Use userContext.role as primary mode detection.
+- If role missing, infer from message.
+
+Modes:
+- customer → user needs help solving own issue
+- agent → support staff analyzing customer issue
+
+Intent:
+- troubleshoot → solve issue
+- reply → draft response
+- analyze → root cause / diagnosis
+- escalate → needs higher support
+- action → account/payment/manual action needed
+
+Severity:
+- low
+- medium
+- high
+- critical (security, payment, outage, data loss)
+
+Behavior:
+- understand issue
+- ask follow-up if needed
+- avoid hallucination
+- use conversation history
+- be practical
+
+Customer mode:
+- simple language
+- step-by-step troubleshooting
+
+Agent mode:
+- technical analysis
+- root cause
+- escalation advice
+
+Return ONLY valid JSON:
+{
+  "mode": "",
+  "intent": "",
+  "severity": "",
+  "reply": ""
+}
+`;
+
+  // const SYSTEM_PROMPT = `You are SupportHub AI.
+
+  // Mode:
+  // - customer
+  // - agent
+
+  // User Context:
+  // ${JSON.stringify(slimUserContext)}
+
+  // Rules:
+  // - Use userContext.role for mode detection.
+
+  // Intent:
+  // - troubleshoot
+  // - reply
+  // - analyze
+  // - escalate
+  // - action
+
+  // Severity:
+  // low | medium | high | critical
+
+  // Customer:
+  // simple troubleshooting
+
+  // Agent:
+  // technical analysis
+
+  // Return JSON only:
+  // {
+  //  mode,
+  //  intent,
+  //  severity,
+  //  reply
+  // }`
+
+  // ===== Final Messages =====
+  const messages = [
+    {
+      role: "system",
+      content: SYSTEM_PROMPT,
+    },
+    ...history,
+    {
+      role: "user",
+      content: message,
+    },
+  ];
+
+  try {
+    console.log("Message: ", messages);
+
+    const completion = await openai.chat.completions.create({
+      model,
+      temperature: 0.3,
+      messages,
+      // response_format: { type: "json_object" }, // if supported
+    });
+
+    const raw = completion.choices[0].message.content;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parsed = {
+        mode: slimUserContext.role || "customer",
+        intent: "troubleshoot",
+        severity: "medium",
+        reply: raw,
+      };
+    }
+
+    return {
+      ...parsed,
+      meta: {
+        model,
+        tokensUsed: completion.usage?.total_tokens || 0,
+      },
+    };
+  } catch (error) {
+    console.error("chatWithAssistant error:", error);
+    throw new Error("AI response failed");
+  }
+}
+
+// ===================================================================
+
+module.exports = { analyzeTicket, chatWithAssistant };
+
+// async function chatWithAssistant({
+//   message,
+//   conversationHistory = [],
+//   userContext = {},
+// }) {
+//   if (!message) {
+//     throw new Error("message is required");
+//   }
+
+//   const model = process.env.OPENROUTER_AI_MODEL;
+
+//   const SYSTEM_CHAT_PROMPT = `
+// You are SupportHub AI Assistant, an enterprise AI support assistant.
+
+// ================================================
+// PRIMARY PURPOSE
+// ================================================
+// You assist in two modes:
+
+// 1. CUSTOMER MODE
+// - End users ask for help regarding their own problems.
+
+// 2. SUPPORT AGENT MODE
+// - Support staff ask for help analyzing customer problems.
+
+// You must automatically detect the correct mode.
+
+// ================================================
+// MODE DETECTION
+// ================================================
+// CUSTOMER MODE examples:
+// - I cannot login
+// - My dashboard is broken
+// - Payment failed
+
+// SUPPORT AGENT MODE examples:
+// - Customer says payment failed
+// - Analyze this ticket
+// - Help me draft a response
+
+// Default:
+// customer
+
+// ================================================
+// INTENT DETECTION
+// ================================================
+// Classify user intent into ONE:
+
+// - troubleshoot
+// - reply
+// - analyze
+// - escalate
+
+// Rules:
+// troubleshoot:
+// User wants solution
+
+// reply:
+// User wants message/email/reply draft
+
+// analyze:
+// User wants diagnosis / summary
+
+// escalate:
+// Issue requires higher support tier
+
+// ================================================
+// SEVERITY CLASSIFICATION
+// ================================================
+// Classify issue:
+
+// low:
+// Minor inconvenience
+
+// medium:
+// Partial workflow blocked
+
+// high:
+// Major workflow blocked
+
+// critical:
+// Security issue / outage / payment failure / data loss
+
+// ================================================
+// BEHAVIOR RULES
+// ================================================
+// Always:
+// - Understand real problem
+// - Ask follow-up if needed
+// - Avoid hallucination
+// - Be practical
+// - Use conversation history
+// - Explain clearly
+
+// CUSTOMER MODE:
+// - Use simple language
+// - Be empathetic
+// - Step-by-step troubleshooting
+
+// AGENT MODE:
+// - Think like senior support engineer
+// - Help classify issue
+// - Suggest root causes
+// - Draft professional responses if needed
+
+// ================================================
+// REPLY RULES
+// ================================================
+// Return ONLY valid JSON.
+
+// Schema:
+
+// {
+//   "mode": "customer | agent",
+//   "intent": "troubleshoot | reply | analyze | escalate",
+//   "severity": "low | medium | high | critical",
+//   "reply": "assistant response here"
+// }
+// `;
+
+//   const messages = [
+//     {
+//       role: "system",
+//       content: SYSTEM_CHAT_PROMPT,
+//     },
+//   ];
+
+//   if (Object.keys(userContext).length) {
+//     messages.push({
+//       role: "system",
+//       content: `User Context: ${JSON.stringify(userContext)}`,
+//     });
+//   }
+
+//   if (conversationHistory.length) {
+//     conversationHistory.forEach((msg) => {
+//       messages.push({
+//         role: msg.sender === "ai" ? "assistant" : "user",
+//         content: msg.message,
+//       });
+//     });
+//   }
+
+//   messages.push({
+//     role: "user",
+//     content: message,
+//   });
+
+//   const completion = await openai.chat.completions.create({
+//     model,
+//     temperature: 0.3,
+//     messages,
+//   });
+
+//   console.log(messages)
+
+//   const raw = completion.choices[0].message.content;
+//   const parsed = safeParse(raw);
+
+//   return {
+//     ...parsed,
+//     meta: {
+//       model,
+//       tokensUsed: completion.usage?.total_tokens || 0,
+//     },
+//   };
+// }
