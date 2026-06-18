@@ -3,7 +3,7 @@ const cors = require("cors");
 const crypto = require("crypto");
 const app = express();
 const port = process.env.PORT || 3021;
-const { MongoClient, ServerApiVersion } = require("mongodb");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const { analyzeTicket, chatWithAssistant } = require("./ai-agents");
 require("dotenv").config();
 
@@ -83,7 +83,6 @@ async function run() {
     const notifications = DB.collection("notifications");
     const aiConversations = DB.collection("aiConversations");
     const aiMessages = DB.collection("aiMessages");
-    const aiUsage = DB.collection("aiUsage");
 
     // ============= notification function ==================
     const createNotification = async ({
@@ -703,7 +702,7 @@ async function run() {
       },
     );
 
-    // ====================== AI ANALYZE TICKET =============================
+    // ================================================ AI ANALYZE TICKET ==========================================
     app.post("/ai/analyze-ticket", verifyFirebaseToken, async (req, res) => {
       try {
         const { description, attachments } = req.body;
@@ -739,7 +738,7 @@ async function run() {
     // ======================== AI CHAT-BOT ASSISTANT =============================
     app.post("/ai/chat", verifyFirebaseToken, async (req, res) => {
       try {
-        const { message, conversationId, conversationHistory } = req.body;
+        const { message, conversationId = null } = req.body;
         const uid = req.user.uid;
 
         if (!message) {
@@ -765,53 +764,52 @@ async function run() {
           });
         }
         const userContext = { user };
-
-        // ===== create or load conversation =====
-        let conversation;
-        let conversationObjectId;
+        let newConversationId = null;
+        let isNewConversation = false;
 
         // ===== create or load conversation =====
         if (!conversationId) {
           const insertResult = await aiConversations.insertOne({
             uid: uid,
-            preview: message.slice(0, 80),
+            preview: null,
+            details: null,
             createdAt: new Date(),
             updatedAt: new Date(),
           });
-
-          conversationObjectId = insertResult.insertedId;
-
-          conversation = {
-            _id: conversationObjectId,
-          };
+          newConversationId = insertResult.insertedId;
+          isNewConversation = true;
         } else {
-          conversationObjectId = new ObjectId(conversationId);
+          if (!ObjectId.isValid(conversationId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Invalid conversationId",
+            });
+          }
 
-          conversation = await aiConversations.findOne({
-            _id: conversationObjectId,
+          newConversationId = new ObjectId(conversationId);
+
+          const findResult = await aiConversations.findOne({
+            _id: newConversationId,
             uid: uid,
           });
 
           // fallback create
-          if (!conversation) {
+          if (!findResult) {
             const insertResult = await aiConversations.insertOne({
               uid: uid,
-              preview: message.slice(0, 80),
+              preview: null,
+              details: null,
               createdAt: new Date(),
               updatedAt: new Date(),
             });
-
-            conversationObjectId = insertResult.insertedId;
-
-            conversation = {
-              _id: conversationObjectId,
-            };
+            newConversationId = insertResult.insertedId;
+            isNewConversation = true;
           }
         }
 
         // ===== fetch history =====
         const historyDocs = await aiMessages
-          .find({ conversationId: conversation._id })
+          .find({ conversationId: newConversationId })
           .sort({ createdAt: 1 }) // ascending
           .limit(10)
           .toArray();
@@ -820,6 +818,7 @@ async function run() {
           role: m.sender === "ai" ? "assistant" : "user",
           content: m.message,
         }));
+        // console.log(history);
 
         // ===== AI CALL =====
         const result = await chatWithAssistant({
@@ -828,16 +827,16 @@ async function run() {
           userContext,
         });
 
-        // ===== SAVE MESSAGES =====
+        // // ===== SAVE MESSAGES =====
         await aiMessages.insertMany([
           {
-            conversationId: conversation._id,
+            conversationId: newConversationId,
             sender: "user",
             message,
             createdAt: new Date(),
           },
           {
-            conversationId: conversation._id,
+            conversationId: newConversationId,
             sender: "ai",
             message: result.reply,
             meta: {
@@ -851,10 +850,40 @@ async function run() {
           },
         ]);
 
-        // ==================
+        // ===== update conversation after AI response =====
+        if (isNewConversation) {
+          await aiConversations.updateOne(
+            { _id: newConversationId, uid: uid },
+            {
+              $set: {
+                preview:
+                  result.preview ||
+                  result.reply?.slice(0, 60) ||
+                  "New conversation",
+                details:
+                  result.details ||
+                  result.reply?.slice(0, 120) ||
+                  "AI conversation started",
+                updatedAt: new Date(),
+              },
+            },
+          );
+        } else {
+          await aiConversations.updateOne(
+            { _id: newConversationId, uid: uid },
+            {
+              $set: {
+                updatedAt: new Date(),
+              },
+            },
+          );
+        }
+
+        // // ==================
 
         return res.send({
           success: true,
+          conversationId: newConversationId,
           data: result,
         });
       } catch (error) {
@@ -867,7 +896,140 @@ async function run() {
       }
     });
 
-    // ==============================================
+    // ======================== GET AI CONVERSATION HISTORY =============================
+    app.get("/ai/conversations", verifyFirebaseToken, async (req, res) => {
+      try {
+        const { search, page = 1, limit = 30 } = req.query;
+        const uid = req.user.uid;
+
+        if (!uid) {
+          return res.status(400).send({
+            success: false,
+            message: "Uid not found",
+          });
+        }
+
+        const query = {
+          uid: uid,
+        };
+
+        // ===== search by preview/details =====
+        if (search?.trim()) {
+          query.$or = [
+            {
+              preview: {
+                $regex: search.trim(),
+                $options: "i",
+              },
+            },
+            {
+              details: {
+                $regex: search.trim(),
+                $options: "i",
+              },
+            },
+          ];
+        }
+
+        const pageNumber = Number(page);
+        const limitNumber = Number(limit);
+        const skip = (pageNumber - 1) * limitNumber;
+
+        const total = await aiConversations.countDocuments(query);
+
+        const conversations = await aiConversations
+          .find(query, {
+            projection: {
+              preview: 1,
+              details: 1,
+              updatedAt: 1,
+            },
+          })
+          .sort({ updatedAt: -1 })
+          .skip(skip)
+          .limit(limitNumber)
+          .toArray();
+
+        return res.send({
+          success: true,
+          data: conversations,
+          pagination: {
+            total,
+            page: pageNumber,
+            limit: limitNumber,
+            totalPages: Math.ceil(total / limitNumber),
+          },
+        });
+      } catch (error) {
+        console.error("Get AI conversations error:", error);
+
+        return res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+
+    // ======================== GET AI CONVERSATION MESSAGES ============================
+    app.get(
+      "/ai/conversations/:conversationId/messages",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const uid = req.user.uid;
+          const { conversationId } = req.params;
+
+          if (!uid) {
+            return res.status(400).send({
+              success: false,
+              message: "Uid not found",
+            });
+          }
+
+          if (!conversationId || !ObjectId.isValid(conversationId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Invalid conversationId",
+            });
+          }
+
+          // for security check
+          const conversation = await aiConversations.findOne({
+            _id: new ObjectId(conversationId),
+            uid: uid,
+          });
+
+          if (!conversation) {
+            return res.status(404).send({
+              success: false,
+              message: "Conversation not found",
+            });
+          }
+
+          const messages = await aiMessages
+            .find({
+              conversationId: new ObjectId(conversationId),
+            })
+            .sort({ createdAt: 1 })
+            .toArray();
+
+          return res.send({
+            success: true,
+            conversation,
+            data: messages,
+          });
+        } catch (error) {
+          console.error("Get AI messages error:", error);
+
+          return res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+
+    // ==================================================================================
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });

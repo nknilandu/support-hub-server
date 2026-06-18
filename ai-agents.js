@@ -399,8 +399,22 @@ Return ONLY valid JSON:
   "mode": "",
   "intent": "",
   "severity": "",
+  "preview": "",
+  "details": "",
   "reply": ""
 }
+
+preview rules:
+- one short line
+- maximum 40 characters
+- suitable as chat title
+- no quotation marks
+
+details rules:
+- one short line
+- maximum 120 characters
+- summarize what the user needs
+- no markdown
 `;
 
   // const SYSTEM_PROMPT = `You are SupportHub AI.
@@ -453,7 +467,7 @@ Return ONLY valid JSON:
   ];
 
   try {
-    console.log("Message: ", messages);
+    // console.log("Message: ", messages);
 
     const completion = await openai.chat.completions.create({
       model,
