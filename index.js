@@ -113,51 +113,114 @@ async function run() {
 
     // ================  Create users collections ===============
     app.post("/users", async (req, res) => {
-      const userBody = req.body;
+      try {
+        const userBody = req.body;
 
-      //const result = client.db('Any_Name').collection('Any_collection_name').insertOne({Object})
-      const existingUser = await users.findOne({ email: userBody.email });
+        if (!userBody?.email) {
+          return res.status(400).send({
+            success: false,
+            message: "Email is required",
+          });
+        }
 
-      if (existingUser) {
-        return res.status(200).send({
-          success: true,
-          message: "User already exists",
-          insertedId: existingUser._id,
-          existing: true,
+        //const result = client.db('Any_Name').collection('Any_collection_name').insertOne({Object})
+        const existingUser = await users.findOne({ email: userBody.email });
+
+        if (existingUser) {
+          return res.status(200).send({
+            success: true,
+            message: "User already exists",
+            insertedId: existingUser._id,
+            existing: true,
+          });
+        }
+
+        const newUserBody = {
+          ...userBody,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await users.insertOne(newUserBody);
+
+        if (result.acknowledged) {
+          return res.status(201).send({
+            success: true,
+            message: "User added successfully",
+            insertedId: result.insertedId,
+            existing: false,
+          });
+        }
+        return res.status(400).send({
+          success: false,
+          message: "User not added",
+        });
+      } catch (error) {
+        console.error(error);
+        return res.status(500).send({
+          success: false,
+          message: "Internal server error",
         });
       }
-      const result = await users.insertOne(userBody);
-
-      if (result.acknowledged) {
-        return res.status(201).send({
-          success: true,
-          message: "User added successfully",
-          insertedId: result.insertedId,
-          existing: false,
-        });
-      }
-      return res.status(400).send({
-        success: false,
-        message: "User not added",
-      });
     });
 
     // ============== Create companies collection ==============
     app.post("/companies", async (req, res) => {
-      const dataBody = req.body;
-      const result = await companies.insertOne(dataBody);
+      try {
+        const dataBody = req.body;
 
-      if (result.acknowledged) {
-        return res.status(201).send({
-          success: true,
-          message: "Company added successfully",
-          insertedId: result.insertedId,
+        // validation
+        if (!dataBody?.companyName?.trim()) {
+          return res.status(400).send({
+            success: false,
+            message: "Company name is required",
+          });
+        }
+
+        const companyName = dataBody.companyName.trim().toLowerCase();
+
+        // duplicate check
+        // const existingCompany = await companies.findOne({ companyName });
+
+        // if (existingCompany) {
+        //   return res.status(200).send({
+        //     success: true,
+        //     message: "Company already exists",
+        //     insertedId: existingCompany._id,
+        //     existing: true,
+        //   });
+        // }
+
+        const newCompany = {
+          ...dataBody,
+          companyName,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await companies.insertOne(newCompany);
+
+        if (result.acknowledged) {
+          return res.status(201).send({
+            success: true,
+            message: "Company added successfully",
+            insertedId: result.insertedId,
+            existing: false,
+          });
+        }
+
+        return res.status(400).send({
+          success: false,
+          message: "Company not added",
+        });
+      } catch (error) {
+        console.error(error);
+
+        return res.status(500).send({
+          success: false,
+          message: "Internal server error",
         });
       }
-      return res.status(400).send({
-        success: false,
-        message: "Company not added",
-      });
     });
 
     // ============== Create companies collection ==============
@@ -820,6 +883,16 @@ async function run() {
         }));
         // console.log(history);
 
+        // ===== SAVE USER MESSAGE FIRST =====
+        const userMessageDoc = {
+          conversationId: newConversationId,
+          sender: "user",
+          message,
+          createdAt: new Date(),
+        };
+
+        const userMessageResult = await aiMessages.insertOne(userMessageDoc);
+
         // ===== AI CALL =====
         const result = await chatWithAssistant({
           message,
@@ -827,28 +900,22 @@ async function run() {
           userContext,
         });
 
-        // // ===== SAVE MESSAGES =====
-        await aiMessages.insertMany([
-          {
-            conversationId: newConversationId,
-            sender: "user",
-            message,
-            createdAt: new Date(),
+        // ===== SAVE AI MESSAGE =====
+        const aiMessageDoc = {
+          conversationId: newConversationId,
+          sender: "ai",
+          message: result.reply,
+          meta: {
+            mode: result.mode,
+            intent: result.intent,
+            severity: result.severity,
+            tokensUsed: result.meta?.tokensUsed,
+            model: result.meta?.model,
           },
-          {
-            conversationId: newConversationId,
-            sender: "ai",
-            message: result.reply,
-            meta: {
-              mode: result.mode,
-              intent: result.intent,
-              severity: result.severity,
-              tokensUsed: result.meta.tokensUsed,
-              model: result.meta.model,
-            },
-            createdAt: new Date(),
-          },
-        ]);
+          createdAt: new Date(),
+        };
+
+        const aiMessageResult = await aiMessages.insertOne(aiMessageDoc);
 
         // ===== update conversation after AI response =====
         if (isNewConversation) {
@@ -879,12 +946,21 @@ async function run() {
           );
         }
 
-        // // ==================
-
+        // ==================
         return res.send({
           success: true,
-          conversationId: newConversationId,
+          conversationId: newConversationId.toString(),
           data: result,
+          messages: {
+            user: {
+              _id: userMessageResult.insertedId,
+              ...userMessageDoc,
+            },
+            ai: {
+              _id: aiMessageResult.insertedId,
+              ...aiMessageDoc,
+            },
+          },
         });
       } catch (error) {
         console.error("AI Chat Error:", error);
