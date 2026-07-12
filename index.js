@@ -861,6 +861,35 @@ async function run() {
             },
           );
 
+          if (result.matchedCount === 0) {
+            return res.status(404).send({
+              success: false,
+              message: "Ticket already assigned or not found",
+            });
+          }
+
+          // Updated ticket get
+          const ticket = await tickets.findOne({
+            _id: new ObjectId(ticketId),
+          });
+
+          // ============ Notification ============
+          try {
+            await createNotification({
+              uid: ticket.uid,
+              userEmail: ticket.email,
+              title: "Ticket Assigned By Agent",
+              message: `Your ticket ${ticket.ticketNumber} has been assigned to ${req.agent.displayName}.`,
+              type: "ticket_assigned",
+              ticketId: ticket._id,
+              ticketNumber: ticket.ticketNumber,
+              path: "/customer/my-tickets",
+            });
+          } catch (notificationError) {
+            console.log("Notification error:", notificationError.message);
+          }
+          // =====================================
+
           res.send({
             success: true,
             message: "Ticket assigned",
