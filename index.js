@@ -26,6 +26,7 @@ const generateTicketNumber = () => {
 };
 
 //=============  verifyFirebaseToken =================
+// ===================================================
 const verifyFirebaseToken = async (req, res, next) => {
   if (!req.headers.authorization) {
     return res
@@ -83,6 +84,46 @@ async function run() {
     const notifications = DB.collection("notifications");
     const aiConversations = DB.collection("aiConversations");
     const aiMessages = DB.collection("aiMessages");
+
+    // ====================== MiddleWare =======================
+    // ============= Verify Agent ==================
+    // ============================================
+    const verifyAgent = async (req, res, next) => {
+      try {
+        const email = req.user.email;
+        if (!email) {
+          return res.status(401).send({
+            success: false,
+            message: "Unauthorized access",
+          });
+        }
+
+        const agent = await users.findOne({ email });
+        if (!agent) {
+          return res.status(404).send({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        if (agent.role !== "agent") {
+          return res.status(403).send({
+            success: false,
+            message: "Agent access required",
+          });
+        }
+
+        req.agent = agent;
+        next();
+      } catch (e) {
+        return res.status(500).send({
+          success: false,
+          error: e || "something went wrong",
+          message: "Internal server error",
+        });
+      }
+    };
+    // ====================== MiddleWare =======================
 
     // ============= notification function ==================
     const createNotification = async ({
@@ -223,7 +264,7 @@ async function run() {
       }
     });
 
-    // ============== Create companies collection ==============
+    // ============== Get companies collection ==============
     app.get("/companies", async (req, res) => {
       const result = await companies
         .find(
@@ -341,7 +382,6 @@ async function run() {
     });
 
     // ================= CREATE TICKET =================
-
     app.post("/tickets", verifyFirebaseToken, async (req, res) => {
       try {
         const bodyData = req.body;
@@ -352,10 +392,26 @@ async function run() {
             message: "Required fields missing",
           });
         }
+        // find user for companyId
+        const user = await users.findOne({ uid: req.user.uid });
+        if (!user) {
+          return res.status(404).send({
+            success: false,
+            message: "User not found",
+          });
+        }
+        if (!user.companyId || !ObjectId.isValid(user.companyId)) {
+          return res.status(400).send({
+            success: false,
+            message: "User is not connected to any company",
+          });
+        }
+        // generate ticket number
         const ticketNumber = generateTicketNumber();
         const ticket = {
           ...bodyData,
           ticketNumber: ticketNumber,
+          companyId: new ObjectId(user.companyId),
           createdAt: new Date(),
           updatedAt: new Date(),
         };
@@ -378,7 +434,6 @@ async function run() {
           console.error("Notification error:", notifyErr.message);
         }
         // ============
-
         return res.status(201).send({
           success: true,
           message: "Ticket created successfully",
@@ -394,7 +449,6 @@ async function run() {
     });
 
     // ================= GET MY TICKETS =================
-
     app.get("/tickets/my-tickets", verifyFirebaseToken, async (req, res) => {
       try {
         const {
@@ -478,7 +532,6 @@ async function run() {
     });
 
     // ============================================= customer dashboard =============================================
-
     app.get(
       "/dashboard/customer-overview",
       verifyFirebaseToken,
@@ -671,7 +724,156 @@ async function run() {
       },
     );
 
-    // ============================================= ================== =============================================
+    // ============================================= AGENT RELATED ==================================================
+    // ================= GET COMPANY TICKETS =================
+    app.get(
+      "/agent/company-tickets",
+      verifyFirebaseToken,
+      verifyAgent,
+      async (req, res) => {
+        try {
+          const {
+            search,
+            status,
+            priority,
+            category,
+            page = 1,
+            limit = 10,
+          } = req.query;
+
+          // company filter
+          const queryData = {
+            companyId: new ObjectId(req.agent.companyId),
+          };
+
+          // Search
+          if (search) {
+            queryData.$or = [
+              {
+                ticketNumber: {
+                  $regex: search,
+                  $options: "i",
+                },
+              },
+              {
+                "aiResult.ticketTitle": {
+                  $regex: search,
+                  $options: "i",
+                },
+              },
+              {
+                email: {
+                  $regex: search,
+                  $options: "i",
+                },
+              },
+            ];
+          }
+          // Status
+          if (status) {
+            queryData.status = {
+              $regex: new RegExp(`^${status}$`, "i"),
+            };
+          }
+          // Category
+          if (category) {
+            queryData["aiResult.category"] = {
+              $regex: new RegExp(`^${category}$`, "i"),
+            };
+          }
+          // Priority
+          if (priority) {
+            queryData["aiResult.states"] = {
+              $elemMatch: {
+                title: { $regex: /^priority$/i },
+                value: { $regex: new RegExp(`^${priority}$`, "i") },
+              },
+            };
+          }
+
+          // ======= pagination ========
+          const skip = (Number(page) - 1) * Number(limit);
+          const total = await tickets.countDocuments(queryData);
+
+          const result = await tickets
+            .find(queryData)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(Number(limit))
+            .toArray();
+
+          console.log(queryData);
+          console.log(result);
+          return res.send({
+            success: true,
+            data: result,
+            currentAgent: req.agent.email,
+            pagination: {
+              total,
+              page: Number(page),
+              limit: Number(limit),
+              totalPages: Math.ceil(total / limit),
+            },
+          });
+        } catch (error) {
+          return res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+
+    // =============== HANDLE TO ASSIGN TICKET =================
+    app.patch(
+      "/agent/tickets/:id/assign",
+      verifyFirebaseToken,
+      verifyAgent,
+      async (req, res) => {
+        try {
+          const ticketId = req.params.id;
+
+          // Ticket ID validation
+          if (!ObjectId.isValid(ticketId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Invalid ticket id",
+            });
+          }
+
+          const assignedAgent = {
+            displayName: req.agent.displayName,
+            email: req.agent.email,
+            uid: req.agent.uid,
+          };
+
+          const result = await tickets.updateOne(
+            {
+              _id: new ObjectId(ticketId),
+              assignedAgent: { $exists: false },
+            },
+            {
+              $set: {
+                assignedAgent,
+                status: "assigned",
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          res.send({
+            success: true,
+            message: "Ticket assigned",
+            result,
+          });
+        } catch (error) {
+          res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
 
     //  ============ notification ==============
     app.get("/notifications", verifyFirebaseToken, async (req, res) => {
