@@ -610,11 +610,11 @@ async function run() {
           });
 
           // ==========================
-          // ACTIVITY CHART (LAST 7 DAYS)
+          // ACTIVITY CHART (LAST 12 MONTHS)
           // ==========================
 
-          const sevenDaysAgo = new Date();
-          sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+          const twelveMonthsAgo = new Date();
+          twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 11);
 
           const activityAggregation = await tickets
             .aggregate([
@@ -622,7 +622,7 @@ async function run() {
                 $match: {
                   email,
                   createdAt: {
-                    $gte: sevenDaysAgo,
+                    $gte: twelveMonthsAgo,
                   },
                 },
               },
@@ -630,7 +630,7 @@ async function run() {
                 $group: {
                   _id: {
                     $dateToString: {
-                      format: "%Y-%m-%d",
+                      format: "%Y-%m",
                       date: "$createdAt",
                     },
                   },
@@ -649,18 +649,19 @@ async function run() {
 
           const activityChart = [];
 
-          for (let i = 6; i >= 0; i--) {
+          for (let i = 11; i >= 0; i--) {
             const date = new Date();
-            date.setDate(date.getDate() - i);
+            date.setMonth(date.getMonth() - i);
 
-            const dateString = date.toISOString().split("T")[0];
+            const monthString = date.toISOString().slice(0, 7);
+
             const found = activityAggregation.find(
-              (item) => item._id === dateString,
+              (item) => item._id === monthString,
             );
 
             activityChart.push({
-              day: date.toLocaleDateString("en-US", {
-                weekday: "short",
+              month: date.toLocaleDateString("en-US", {
+                month: "short",
               }),
               count: found?.count || 0,
             });
@@ -725,6 +726,180 @@ async function run() {
     );
 
     // ============================================= AGENT RELATED ==================================================
+
+    // ================= AGENT DASHBOARD =================
+    app.get(
+      "/dashboard/agent-overview",
+      verifyFirebaseToken,
+      verifyAgent,
+      async (req, res) => {
+        try {
+          const agentEmail = req.agent.email;
+          const companyId = new ObjectId(req.agent.companyId);
+
+          // ================= Metrics =================
+          const assignedToMe = await tickets.countDocuments({
+            "assignedAgent.email": agentEmail,
+          });
+
+          const openCompanyTickets = await tickets.countDocuments({
+            companyId,
+            status: "open",
+          });
+
+          const inProgressTickets = await tickets.countDocuments({
+            "assignedAgent.email": agentEmail,
+            status: "in_progress",
+          });
+
+          const resolvedToday = await tickets.countDocuments({
+            "assignedAgent.email": agentEmail,
+            status: "resolved",
+            updatedAt: {
+              $gte: new Date(new Date().setHours(0, 0, 0, 0)),
+            },
+          });
+
+          // ================= Status Chart =================
+          const statusResult = await tickets
+            .aggregate([
+              {
+                $match: {
+                  companyId,
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    $toLower: "$status",
+                  },
+                  count: {
+                    $sum: 1,
+                  },
+                },
+              },
+            ])
+            .toArray();
+
+          const statusChart = {
+            open: 0,
+            assigned: 0,
+            in_progress: 0,
+            resolved: 0,
+            closed: 0,
+          };
+
+          statusResult.forEach((item) => {
+            statusChart[item._id] = item.count;
+          });
+
+          // ================= Priority Chart =================
+          const priorityResult = await tickets
+            .aggregate([
+              {
+                $match: {
+                  companyId,
+                },
+              },
+              {
+                $unwind: "$aiResult.states",
+              },
+              {
+                $match: {
+                  "aiResult.states.title": {
+                    $regex: "^priority$",
+                    $options: "i",
+                  },
+                },
+              },
+
+              {
+                $group: {
+                  _id: {
+                    $toLower: "$aiResult.states.value",
+                  },
+                  count: {
+                    $sum: 1,
+                  },
+                },
+              },
+            ])
+            .toArray();
+
+          const priorityChart = {
+            low: 0,
+            medium: 0,
+            high: 0,
+            critical: 0,
+          };
+
+          priorityResult.forEach((item) => {
+            priorityChart[item._id] = item.count;
+          });
+
+          // ================= Recent Tickets =================
+
+          const recentTickets = await tickets
+            .find({
+              companyId,
+            })
+            .sort({
+              createdAt: -1,
+            })
+            .limit(3)
+            .toArray();
+
+          // ================= Urgent Tickets =================
+          const urgentTickets = await tickets
+            .find({
+              companyId,
+
+              status: {
+                $regex: "^open$",
+                $options: "i",
+              },
+
+              "aiResult.states": {
+                $elemMatch: {
+                  title: {
+                    $regex: "^priority$",
+                    $options: "i",
+                  },
+                  value: {
+                    $regex: "^(high|critical)$",
+                    $options: "i",
+                  },
+                },
+              },
+            })
+            .sort({ createdAt: -1 })
+            .limit(3)
+            .toArray();
+
+          // ====================
+
+          return res.send({
+            success: true,
+            metrics: {
+              assignedToMe,
+              openCompanyTickets,
+              inProgressTickets,
+              resolvedToday,
+            },
+            statusChart,
+            priorityChart,
+            recentTickets,
+            urgentTickets,
+          });
+        } catch (error) {
+          res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+
     // ================= GET COMPANY TICKETS =================
     app.get(
       "/agent/company-tickets",
@@ -875,6 +1050,7 @@ async function run() {
 
           // ============ Notification ============
           try {
+            // Customer notification
             await createNotification({
               uid: ticket.uid,
               userEmail: ticket.email,
@@ -885,6 +1061,19 @@ async function run() {
               ticketNumber: ticket.ticketNumber,
               path: "/customer/my-tickets",
             });
+
+            // Agent activity
+            await createNotification({
+              uid: req.agent.uid,
+              userEmail: req.agent.email,
+              title: "Ticket Claimed",
+              message: `You claimed ticket ${ticket.ticketNumber}.`,
+              type: "ticket_claimed",
+              ticketId: ticket._id,
+              ticketNumber: ticket.ticketNumber,
+              path: `/agent/tickets/${ticket._id}`,
+            });
+            // ===================
           } catch (notificationError) {
             console.log("Notification error:", notificationError.message);
           }
