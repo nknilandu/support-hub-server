@@ -112,6 +112,12 @@ async function run() {
             message: "Agent access required",
           });
         }
+        if (agent.verifyIdAgent !== "approved") {
+          return res.status(403).send({
+            success: false,
+            message: "Your agent account is waiting for admin approval",
+          });
+        }
 
         req.agent = agent;
         next();
@@ -164,6 +170,14 @@ async function run() {
           });
         }
 
+        const allowedRoles = ["customer", "agent", "owner"];
+        if (!allowedRoles.includes(userBody.role)) {
+          return res.status(400).send({
+            success: false,
+            message: "Invalid account role",
+          });
+        }
+
         //const result = client.db('Any_Name').collection('Any_collection_name').insertOne({Object})
         const existingUser = await users.findOne({ email: userBody.email });
 
@@ -178,6 +192,8 @@ async function run() {
 
         const newUserBody = {
           ...userBody,
+          status: "active",
+          verifyIdAgent: userBody.role === "agent" ? "pending" : "approved",
           createdAt: new Date(),
           updatedAt: new Date(),
         };
@@ -235,6 +251,7 @@ async function run() {
         const newCompany = {
           ...dataBody,
           companyName,
+          status: "active",
           createdAt: new Date(),
           updatedAt: new Date(),
         };
@@ -999,16 +1016,253 @@ async function run() {
       },
     );
 
+    // ================= GET AGENT ASSIGNED TICKETS =================
+    app.get(
+      "/agent/assigned-tickets",
+      verifyFirebaseToken,
+      verifyAgent,
+      async (req, res) => {
+        try {
+          const {
+            search,
+            status,
+            priority,
+            category,
+            page = 1,
+            limit = 10,
+          } = req.query;
+
+          if (!req.agent.companyId || !ObjectId.isValid(req.agent.companyId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Agent company information is invalid",
+            });
+          }
+
+          const queryData = {
+            companyId: new ObjectId(req.agent.companyId),
+            "assignedAgent.email": req.agent.email,
+          };
+
+          // Search
+          if (search) {
+            queryData.$or = [
+              {
+                ticketNumber: {
+                  $regex: search,
+                  $options: "i",
+                },
+              },
+              {
+                "aiResult.ticketTitle": {
+                  $regex: search,
+                  $options: "i",
+                },
+              },
+              {
+                email: {
+                  $regex: search,
+                  $options: "i",
+                },
+              },
+            ];
+          }
+
+          // Status
+          if (status) {
+            queryData.status = {
+              $regex: new RegExp(`^${status}$`, "i"),
+            };
+          }
+
+          // Category
+          if (category) {
+            queryData["aiResult.category"] = {
+              $regex: new RegExp(`^${category}$`, "i"),
+            };
+          }
+
+          // Priority
+          if (priority) {
+            queryData["aiResult.states"] = {
+              $elemMatch: {
+                title: {
+                  $regex: /^priority$/i,
+                },
+                value: {
+                  $regex: new RegExp(`^${priority}$`, "i"),
+                },
+              },
+            };
+          }
+
+          // Pagination
+          const pageNumber = Number(page);
+          const limitNumber = Number(limit);
+          const skip = (pageNumber - 1) * limitNumber;
+
+          const total = await tickets.countDocuments(queryData);
+
+          const result = await tickets
+            .find(queryData)
+            .sort({
+              updatedAt: -1,
+              createdAt: -1,
+            })
+            .skip(skip)
+            .limit(limitNumber)
+            .toArray();
+
+          return res.send({
+            success: true,
+            data: result,
+            currentAgent: req.agent.email,
+            pagination: {
+              total,
+              page: pageNumber,
+              limit: limitNumber,
+              totalPages: Math.ceil(total / limitNumber),
+            },
+          });
+        } catch (error) {
+          console.error("Assigned tickets error:", error);
+
+          return res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+
     // =============== HANDLE TO ASSIGN TICKET =================
+// ================= ASSIGN TICKET TO AGENT =================
+app.patch(
+  "/agent/tickets/:id/assign",
+  verifyFirebaseToken,
+  verifyAgent,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid ticket id",
+        });
+      }
+
+      if (
+        !req.agent.companyId ||
+        !ObjectId.isValid(req.agent.companyId)
+      ) {
+        return res.status(400).send({
+          success: false,
+          message: "Agent company information is invalid",
+        });
+      }
+
+      const ticketId = new ObjectId(id);
+      const companyId = new ObjectId(req.agent.companyId);
+      const assignedAt = new Date();
+
+      const assignedAgent = {
+        uid: req.agent.uid,
+        email: req.agent.email,
+        displayName: req.agent.displayName,
+      };
+
+      const result = await tickets.updateOne(
+        {
+          _id: ticketId,
+          companyId,
+          status: "open",
+          assignedAgent: { $exists: false },
+        },
+        {
+          $set: {
+            assignedAgent,
+            status: "assigned",
+            assignedAt,
+            updatedAt: assignedAt,
+          },
+          $push: {
+            assignmentHistory: {
+              action: "assigned",
+              agent: assignedAgent,
+              createdAt: assignedAt,
+            },
+          },
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(409).send({
+          success: false,
+          message:
+            "Ticket is already assigned, unavailable, or does not belong to your company",
+        });
+      }
+
+      const ticket = await tickets.findOne({
+        _id: ticketId,
+        companyId,
+      });
+
+      try {
+        await createNotification({
+          uid: ticket.uid,
+          userEmail: ticket.email,
+          title: "Ticket Assigned",
+          message: `Your ticket ${ticket.ticketNumber} has been assigned to ${req.agent.displayName}.`,
+          type: "ticket_assigned",
+          ticketId: ticket._id,
+          ticketNumber: ticket.ticketNumber,
+          path: "/customer/my-tickets",
+        });
+
+        await createNotification({
+          uid: req.agent.uid,
+          userEmail: req.agent.email,
+          title: "Ticket Claimed",
+          message: `You claimed ticket ${ticket.ticketNumber}.`,
+          type: "ticket_claimed",
+          ticketId: ticket._id,
+          ticketNumber: ticket.ticketNumber,
+          path: `/agent/tickets/${ticket._id}`,
+        });
+      } catch (notificationError) {
+        console.error(
+          "Ticket assignment notification error:",
+          notificationError.message,
+        );
+      }
+
+      return res.send({
+        success: true,
+        message: "Ticket assigned successfully",
+        data: ticket,
+      });
+    } catch (error) {
+      console.error("Assign ticket error:", error);
+
+      return res.status(500).send({
+        success: false,
+        message: error.message,
+      });
+    }
+  },
+);
+
+    // ================= RETURN TICKET TO COMPANY QUEUE =================
     app.patch(
-      "/agent/tickets/:id/assign",
+      "/agent/tickets/:id/release",
       verifyFirebaseToken,
       verifyAgent,
       async (req, res) => {
         try {
           const ticketId = req.params.id;
 
-          // Ticket ID validation
           if (!ObjectId.isValid(ticketId)) {
             return res.status(400).send({
               success: false,
@@ -1016,22 +1270,44 @@ async function run() {
             });
           }
 
-          const assignedAgent = {
-            displayName: req.agent.displayName,
-            email: req.agent.email,
-            uid: req.agent.uid,
-          };
+          if (!req.agent.companyId || !ObjectId.isValid(req.agent.companyId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Agent company information is invalid",
+            });
+          }
+
+          const companyId = new ObjectId(req.agent.companyId);
+          const ticketObjectId = new ObjectId(ticketId);
+          const releasedAt = new Date();
 
           const result = await tickets.updateOne(
             {
-              _id: new ObjectId(ticketId),
-              assignedAgent: { $exists: false },
+              _id: ticketObjectId,
+              companyId,
+              "assignedAgent.email": req.agent.email,
+              status: {
+                $in: ["assigned", "in_progress"],
+              },
             },
             {
+              $unset: {
+                assignedAgent: "",
+              },
               $set: {
-                assignedAgent,
-                status: "assigned",
-                updatedAt: new Date(),
+                status: "open",
+                updatedAt: releasedAt,
+              },
+              $push: {
+                assignmentHistory: {
+                  action: "released",
+                  agent: {
+                    uid: req.agent.uid,
+                    email: req.agent.email,
+                    displayName: req.agent.displayName,
+                  },
+                  createdAt: releasedAt,
+                },
               },
             },
           );
@@ -1039,53 +1315,55 @@ async function run() {
           if (result.matchedCount === 0) {
             return res.status(404).send({
               success: false,
-              message: "Ticket already assigned or not found",
+              message:
+                "Ticket not found, already released, or not assigned to you",
             });
           }
 
-          // Updated ticket get
           const ticket = await tickets.findOne({
-            _id: new ObjectId(ticketId),
+            _id: ticketObjectId,
+            companyId,
           });
 
-          // ============ Notification ============
+          // Notification
           try {
-            // Customer notification
             await createNotification({
               uid: ticket.uid,
               userEmail: ticket.email,
-              title: "Ticket Assigned By Agent",
-              message: `Your ticket ${ticket.ticketNumber} has been assigned to ${req.agent.displayName}.`,
-              type: "ticket_assigned",
+              title: "Ticket Returned to Support Queue",
+              message: `Your ticket ${ticket.ticketNumber} has been returned to the support queue and will be assigned to another available agent.`,
+              type: "ticket_released",
               ticketId: ticket._id,
               ticketNumber: ticket.ticketNumber,
-              path: "/customer/my-tickets",
+              path: "/customer/tickets",
             });
 
-            // Agent activity
             await createNotification({
               uid: req.agent.uid,
               userEmail: req.agent.email,
-              title: "Ticket Claimed",
-              message: `You claimed ticket ${ticket.ticketNumber}.`,
-              type: "ticket_claimed",
+              title: "Ticket Returned to Queue",
+              message: `You returned ticket ${ticket.ticketNumber} to the company queue.`,
+              type: "ticket_returned",
               ticketId: ticket._id,
               ticketNumber: ticket.ticketNumber,
-              path: `/agent/tickets/${ticket._id}`,
+              path: "/agent/company-tickets",
             });
-            // ===================
           } catch (notificationError) {
-            console.log("Notification error:", notificationError.message);
+            console.error(
+              "Ticket release notification error:",
+              notificationError.message,
+            );
           }
-          // =====================================
 
-          res.send({
+          return res.send({
             success: true,
-            message: "Ticket assigned",
-            result,
+            message: "Ticket returned to company queue successfully",
+            data: ticket,
           });
         } catch (error) {
-          res.status(500).send({
+          console.error("Release ticket error:", error);
+
+          return res.status(500).send({
             success: false,
             message: error.message,
           });
@@ -1526,6 +1804,65 @@ async function run() {
     );
 
     // ==================================================================================
+    // ==================================================================================
+    // ==================================================================================
+    // ==================================================================================
+    // ==================================================================================
+
+    app.patch(
+      "/admin/agents/:id/approve",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+              success: false,
+              message: "Invalid agent id",
+            });
+          }
+
+          const result = await users.updateOne(
+            {
+              _id: new ObjectId(id),
+              role: "agent",
+              verifyIdAgent: "pending",
+            },
+            {
+              $set: {
+                verifyIdAgent: "approved",
+                status: "active",
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).send({
+              success: false,
+              message: "Pending agent not found",
+            });
+          }
+
+          return res.send({
+            success: true,
+            message: "Agent approved successfully",
+          });
+        } catch (error) {
+          return res.status(500).send({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+    // fetch(`http://localhost:3021/admin/agents/${agentId}/approve`, {
+    //   method: "PATCH",
+    //   headers: {
+    //     authorization: `Bearer ${token}`,
+    //   },
+    // });
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
