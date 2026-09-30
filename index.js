@@ -4,7 +4,11 @@ const crypto = require("crypto");
 const app = express();
 const port = process.env.PORT || 3021;
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-const { analyzeTicket, chatWithAssistant } = require("./ai-agents");
+const {
+  analyzeTicket,
+  chatWithAssistant,
+  suggestAgentReply,
+} = require("./ai-agents");
 require("dotenv").config();
 
 // middleware
@@ -23,6 +27,18 @@ const generateTicketNumber = () => {
   const timePart = Date.now().toString(16).slice(-4).toUpperCase();
   const randomPart = crypto.randomBytes(2).toString("hex").toUpperCase();
   return `TCK-${timePart}${randomPart}`;
+};
+//============== get agent function ====================
+const getCurrentAgentUid = (agentHistory = []) => {
+  if (!agentHistory.length) return null;
+
+  const latest = agentHistory.reduce((latest, current) => {
+    if (!latest) return current;
+
+    return new Date(current.date) > new Date(latest.date) ? current : latest;
+  }, null);
+
+  return latest?.action === "assigned" ? latest.uid : null;
 };
 
 //=============  verifyFirebaseToken =================
@@ -403,7 +419,7 @@ async function run() {
       try {
         const bodyData = req.body;
 
-        if (!bodyData?.uid || !bodyData?.email || !bodyData?.aiResult) {
+        if (!bodyData?.ticketData || !bodyData?.aiResult) {
           return res.status(400).send({
             success: false,
             message: "Required fields missing",
@@ -427,6 +443,7 @@ async function run() {
         const ticketNumber = generateTicketNumber();
         const ticket = {
           ...bodyData,
+          uid: user.uid,
           ticketNumber: ticketNumber,
           companyId: new ObjectId(user.companyId),
           createdAt: new Date(),
@@ -438,8 +455,8 @@ async function run() {
         // ======== create notification ============
         try {
           await createNotification({
-            uid: bodyData.uid,
-            userEmail: bodyData.email,
+            uid: user.uid,
+            userEmail: user.email,
             title: "Ticket Created Successfully",
             message: `Your ticket ${ticketNumber} has been created. Our team will review it shortly.`,
             type: "ticket_created",
@@ -477,13 +494,30 @@ async function run() {
           limit = 10,
         } = req.query;
 
-        const query = {
-          email: req.user.email,
+        const currentUser = await users.findOne({
+          uid: req.user.uid,
+        });
+
+        if (!currentUser) {
+          return res.status(404).send({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        if (currentUser.role !== "customer") {
+          return res.status(403).send({
+            success: false,
+            message: "Only customers can access their tickets",
+          });
+        }
+
+        const queryData = {
+          uid: currentUser.uid,
         };
 
-        // Search
         if (search) {
-          query.$or = [
+          queryData.$or = [
             {
               ticketNumber: {
                 $regex: search,
@@ -498,57 +532,149 @@ async function run() {
             },
           ];
         }
-        // Status
+
         if (status) {
-          query.status = {
+          queryData.status = {
             $regex: new RegExp(`^${status}$`, "i"),
           };
         }
-        // Category
+
         if (category) {
-          query["aiResult.category"] = {
+          queryData["aiResult.category"] = {
             $regex: new RegExp(`^${category}$`, "i"),
           };
         }
-        // Priority
+
         if (priority) {
-          query["aiResult.states"] = {
+          queryData["aiResult.states"] = {
             $elemMatch: {
-              title: { $regex: /^priority$/i },
-              value: { $regex: new RegExp(`^${priority}$`, "i") },
+              title: {
+                $regex: /^priority$/i,
+              },
+              value: {
+                $regex: new RegExp(`^${priority}$`, "i"),
+              },
             },
           };
         }
 
-        const skip = (Number(page) - 1) * Number(limit);
-        const total = await tickets.countDocuments(query);
+        const pageNumber = Number(page);
+        const limitNumber = Number(limit);
+        const skip = (pageNumber - 1) * limitNumber;
+
+        const total = await tickets.countDocuments(queryData);
 
         const result = await tickets
-          .find(query)
-          .sort({ createdAt: -1 })
-          .skip(skip)
-          .limit(Number(limit))
+          .aggregate([
+            {
+              $match: queryData,
+            },
+            {
+              $sort: {
+                createdAt: -1,
+              },
+            },
+            {
+              $skip: skip,
+            },
+            {
+              $limit: limitNumber,
+            },
+            {
+              $lookup: {
+                from: "users",
+                localField: "agentHistory.uid",
+                foreignField: "uid",
+                as: "agentUsers",
+              },
+            },
+            {
+              $lookup: {
+                from: "users",
+                localField: "uid",
+                foreignField: "uid",
+                as: "userInfo",
+              },
+            },
+            {
+              $project: {
+                _id: 1,
+                companyId: 1,
+                ticketNumber: 1,
+                status: 1,
+                supportMode: 1,
+                aiResolved: 1,
+                createdAt: 1,
+                updatedAt: 1,
+                agentHistory: 1,
+
+                "aiResult.category": 1,
+                "aiResult.states": 1,
+                "aiResult.summary": 1,
+                "aiResult.ticketTitle": 1,
+
+                agentUsers: {
+                  uid: 1,
+                  displayName: 1,
+                  name: 1,
+                  email: 1,
+                  photoURL: 1,
+                  role: 1,
+                },
+
+                userInfo: {
+                  uid: 1,
+                  displayName: 1,
+                  name: 1,
+                  email: 1,
+                  photoURL: 1,
+                  role: 1,
+                },
+              },
+            },
+          ])
           .toArray();
+
+        const finalResult = result.map((ticket) => {
+          const currentAgentUid = getCurrentAgentUid(ticket.agentHistory || []);
+
+          const currentAgent = currentAgentUid
+            ? ticket.agentUsers?.find((agent) => agent.uid === currentAgentUid)
+            : null;
+
+          const currentCustomer = ticket.userInfo?.[0] || null;
+
+          const { agentUsers, userInfo, ...ticketWithoutLookup } = ticket;
+
+          return {
+            ...ticketWithoutLookup,
+            agentInfo: currentAgent || null,
+            userInfo: currentCustomer,
+          };
+        });
 
         return res.send({
           success: true,
-          data: result,
+          data: finalResult,
           pagination: {
             total,
-            page: Number(page),
-            limit: Number(limit),
-            totalPages: Math.ceil(total / limit),
+            page: pageNumber,
+            limit: limitNumber,
+            totalPages: Math.ceil(total / limitNumber),
           },
         });
       } catch (error) {
+        console.error("GET MY TICKETS ERROR:", error);
+
         return res.status(500).send({
           success: false,
-          message: error.message,
+          message: "Failed to fetch your tickets",
         });
       }
     });
 
     // ============================================= customer dashboard =============================================
+    // ==============================================================================================================
     app.get(
       "/dashboard/customer-overview",
       verifyFirebaseToken,
@@ -694,7 +820,7 @@ async function run() {
             .sort({
               createdAt: -1,
             })
-            .limit(3)
+            .limit(5)
             .project({
               ticketNumber: 1,
               status: 1,
@@ -742,42 +868,462 @@ async function run() {
       },
     );
 
-    // ============================================= AGENT RELATED ==================================================
+    // ================= GET SINGLE TICKET =================
+    app.get("/tickets/:ticketId", verifyFirebaseToken, async (req, res) => {
+      try {
+        const { ticketId } = req.params;
 
-    // ================= AGENT DASHBOARD =================
+        // ================= VALIDATE TICKET ID =================
+        if (!ObjectId.isValid(ticketId)) {
+          return res.status(400).send({
+            success: false,
+            message: "Invalid ticket ID",
+          });
+        }
+
+        // ================= FIND CURRENT USER FROM DB =================
+        const currentUser = await users.findOne({
+          uid: req.user.uid,
+        });
+
+        if (!currentUser) {
+          return res.status(404).send({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        // ================= FIND TICKET =================
+        const ticket = await tickets.findOne({
+          _id: new ObjectId(ticketId),
+        });
+
+        if (!ticket) {
+          return res.status(404).send({
+            success: false,
+            message: "Ticket not found",
+          });
+        }
+
+        // ================= AGENT INFO =================
+        const agentHistory = ticket.agentHistory || [];
+
+        const currentAgentUid = getCurrentAgentUid(agentHistory);
+
+        // =====================================================
+        // CUSTOMER
+        // =====================================================
+        if (currentUser.role === "customer") {
+          // Customer can only see own ticket
+          if (ticket.uid !== currentUser.uid) {
+            return res.status(403).send({
+              success: false,
+              message: "You are not allowed to view this ticket",
+            });
+          }
+
+          return res.send({
+            success: true,
+            data: ticket,
+            permission: {
+              canView: true,
+              canSendMessage: false,
+              canSuggestReply: false,
+              canRelease: false,
+              canDelete: true,
+              currentAgentUid,
+              isCurrentAgent: false,
+            },
+          });
+        }
+
+        // =====================================================
+        // OWNER / ADMIN
+        // =====================================================
+        if (currentUser.role === "owner" || currentUser.role === "admin") {
+          return res.send({
+            success: true,
+            data: ticket,
+            permission: {
+              canView: true,
+              canSendMessage: false,
+              canSuggestReply: false,
+              canRelease: false,
+              canDelete: true,
+              currentAgentUid,
+              isCurrentAgent: false,
+            },
+          });
+        }
+
+        // =====================================================
+        // AGENT
+        // =====================================================
+        if (currentUser.role === "agent") {
+          const historyAgent = agentHistory.find(
+            (item) => item.uid === currentUser.uid,
+          );
+
+          const isHistoryAgent = !!historyAgent;
+
+          const isCurrentAgent = currentAgentUid === currentUser.uid;
+
+          const isUnassigned = !currentAgentUid;
+
+          // Agent can view:
+          // 1. unassigned ticket
+          // 2. ticket where this agent exists in history
+          const canView = isUnassigned || isHistoryAgent;
+
+          if (!canView) {
+            return res.status(403).send({
+              success: false,
+              message: "You are not allowed to view this ticket",
+            });
+          }
+
+          return res.send({
+            success: true,
+            data: ticket,
+            permission: {
+              canView: true,
+              canSendMessage: isCurrentAgent,
+              canSuggestReply: isCurrentAgent,
+              canRelease: isCurrentAgent,
+              canDelete: false,
+              currentAgentUid,
+              isCurrentAgent,
+              isHistoryAgent,
+            },
+          });
+        }
+
+        // =====================================================
+        // UNKNOWN ROLE
+        // =====================================================
+        return res.status(403).send({
+          success: false,
+          message: "You are not allowed to view this ticket",
+        });
+      } catch (error) {
+        console.error("Get ticket details error:", error);
+
+        return res.status(500).send({
+          success: false,
+          message: "Failed to fetch ticket details",
+          error: error.message,
+        });
+      }
+    });
+
+    // ================= DELETE SINGLE TICKET =================
+    app.delete("/tickets/:ticketId", verifyFirebaseToken, async (req, res) => {
+      try {
+        const { ticketId } = req.params;
+
+        if (!ObjectId.isValid(ticketId)) {
+          return res.status(400).send({
+            success: false,
+            message: "Invalid ticket id",
+          });
+        }
+
+        const currentUser = await users.findOne({
+          uid: req.user.uid,
+        });
+
+        if (!currentUser) {
+          return res.status(404).send({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        const ticket = await tickets.findOne({
+          _id: new ObjectId(ticketId),
+        });
+
+        if (!ticket) {
+          return res.status(404).send({
+            success: false,
+            message: "Ticket not found",
+          });
+        }
+
+        let canDelete = false;
+
+        // Customer own ticket
+        if (currentUser.role === "customer" && ticket.uid === currentUser.uid) {
+          canDelete = true;
+        }
+
+        // Owner/Admin all ticket
+        if (currentUser.role === "owner" || currentUser.role === "admin") {
+          canDelete = true;
+        }
+
+        if (!canDelete) {
+          return res.status(403).send({
+            success: false,
+            message: "You don't have permission to delete this ticket",
+          });
+        }
+
+        const result = await tickets.deleteOne({
+          _id: new ObjectId(ticketId),
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(400).send({
+            success: false,
+            message: "Ticket delete failed",
+          });
+        }
+
+        // notification
+        try {
+          await createNotification({
+            uid: ticket.uid,
+            userEmail: ticket.email,
+            title: "Ticket Deleted",
+            message: `Your ticket ${ticket.ticketNumber} has been deleted.`,
+            type: "ticket_deleted",
+            ticketNumber: ticket.ticketNumber,
+            path: "/customer/my-tickets",
+          });
+        } catch (err) {
+          console.log("Delete notification error:", err.message);
+        }
+
+        return res.send({
+          success: true,
+          message: "Ticket deleted successfully",
+        });
+      } catch (error) {
+        console.error("Delete ticket error:", error);
+
+        return res.status(500).send({
+          success: false,
+          message: error.message,
+        });
+      }
+    });
+
+    // ============================================= AGENT RELATED ==================================================
+    // ==============================================================================================================
+
+    // ================= AGENT DASHBOARD =====================================
     app.get(
       "/dashboard/agent-overview",
       verifyFirebaseToken,
       verifyAgent,
       async (req, res) => {
         try {
-          const agentEmail = req.agent.email;
+          // ================= AGENT INFORMATION =================
+          const agentUid = req.agent.uid;
+
+          if (!req.agent.companyId || !ObjectId.isValid(req.agent.companyId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Agent company information is invalid",
+            });
+          }
+
           const companyId = new ObjectId(req.agent.companyId);
 
-          // ================= Metrics =================
+          // =====================================================
+          // ================= HELPER =============================
+          // =====================================================
+
+          // Check whether this agent is the CURRENT agent
+          // according to the latest agentHistory action
+          const currentAgentMatch = {
+            $expr: {
+              $eq: [
+                {
+                  $let: {
+                    vars: {
+                      latestHistory: {
+                        $arrayElemAt: [
+                          {
+                            $sortArray: {
+                              input: "$agentHistory",
+                              sortBy: {
+                                date: -1,
+                              },
+                            },
+                          },
+                          0,
+                        ],
+                      },
+                    },
+                    in: {
+                      $cond: [
+                        {
+                          $eq: ["$$latestHistory.action", "assigned"],
+                        },
+                        "$$latestHistory.uid",
+                        null,
+                      ],
+                    },
+                  },
+                },
+                agentUid,
+              ],
+            },
+          };
+
+          // =====================================================
+          // ================= METRICS ===========================
+          // =====================================================
+
+          // Total tickets currently assigned to this agent
           const assignedToMe = await tickets.countDocuments({
-            "assignedAgent.email": agentEmail,
-          });
-
-          const openCompanyTickets = await tickets.countDocuments({
             companyId,
-            status: "open",
-          });
-
-          const inProgressTickets = await tickets.countDocuments({
-            "assignedAgent.email": agentEmail,
-            status: "in_progress",
-          });
-
-          const resolvedToday = await tickets.countDocuments({
-            "assignedAgent.email": agentEmail,
-            status: "resolved",
-            updatedAt: {
-              $gte: new Date(new Date().setHours(0, 0, 0, 0)),
+            $expr: {
+              $eq: [
+                {
+                  $let: {
+                    vars: {
+                      latestHistory: {
+                        $arrayElemAt: [
+                          {
+                            $sortArray: {
+                              input: "$agentHistory",
+                              sortBy: {
+                                date: -1,
+                              },
+                            },
+                          },
+                          0,
+                        ],
+                      },
+                    },
+                    in: {
+                      $cond: [
+                        {
+                          $eq: ["$$latestHistory.action", "assigned"],
+                        },
+                        "$$latestHistory.uid",
+                        null,
+                      ],
+                    },
+                  },
+                },
+                agentUid,
+              ],
             },
           });
 
-          // ================= Status Chart =================
+          // =====================================================
+          // ALL OPEN TICKETS OF THIS COMPANY
+          // =====================================================
+
+          const openCompanyTickets = await tickets.countDocuments({
+            companyId,
+            status: {
+              $regex: /^open$/i,
+            },
+          });
+
+          // =====================================================
+          // IN-PROGRESS TICKETS ASSIGNED TO THIS AGENT
+          // =====================================================
+
+          const inProgressTickets = await tickets.countDocuments({
+            companyId,
+            status: {
+              $regex: /^in_progress$/i,
+            },
+            $expr: {
+              $eq: [
+                {
+                  $let: {
+                    vars: {
+                      latestHistory: {
+                        $arrayElemAt: [
+                          {
+                            $sortArray: {
+                              input: "$agentHistory",
+                              sortBy: {
+                                date: -1,
+                              },
+                            },
+                          },
+                          0,
+                        ],
+                      },
+                    },
+                    in: {
+                      $cond: [
+                        {
+                          $eq: ["$$latestHistory.action", "assigned"],
+                        },
+                        "$$latestHistory.uid",
+                        null,
+                      ],
+                    },
+                  },
+                },
+                agentUid,
+              ],
+            },
+          });
+
+          // =====================================================
+          // RESOLVED BY THIS AGENT TODAY
+          // =====================================================
+
+          const todayStart = new Date();
+          todayStart.setHours(0, 0, 0, 0);
+
+          const resolvedToday = await tickets.countDocuments({
+            companyId,
+            status: {
+              $regex: /^resolved$/i,
+            },
+            updatedAt: {
+              $gte: todayStart,
+            },
+            $expr: {
+              $eq: [
+                {
+                  $let: {
+                    vars: {
+                      latestHistory: {
+                        $arrayElemAt: [
+                          {
+                            $sortArray: {
+                              input: "$agentHistory",
+                              sortBy: {
+                                date: -1,
+                              },
+                            },
+                          },
+                          0,
+                        ],
+                      },
+                    },
+                    in: {
+                      $cond: [
+                        {
+                          $eq: ["$$latestHistory.action", "assigned"],
+                        },
+                        "$$latestHistory.uid",
+                        null,
+                      ],
+                    },
+                  },
+                },
+                agentUid,
+              ],
+            },
+          });
+
+          // =====================================================
+          // ================= STATUS CHART ======================
+          // =====================================================
+
           const statusResult = await tickets
             .aggregate([
               {
@@ -807,10 +1353,15 @@ async function run() {
           };
 
           statusResult.forEach((item) => {
-            statusChart[item._id] = item.count;
+            if (item._id in statusChart) {
+              statusChart[item._id] = item.count;
+            }
           });
 
-          // ================= Priority Chart =================
+          // =====================================================
+          // ================= PRIORITY CHART ====================
+          // =====================================================
+
           const priorityResult = await tickets
             .aggregate([
               {
@@ -824,12 +1375,10 @@ async function run() {
               {
                 $match: {
                   "aiResult.states.title": {
-                    $regex: "^priority$",
-                    $options: "i",
+                    $regex: /^priority$/i,
                   },
                 },
               },
-
               {
                 $group: {
                   _id: {
@@ -851,65 +1400,110 @@ async function run() {
           };
 
           priorityResult.forEach((item) => {
-            priorityChart[item._id] = item.count;
+            if (item._id in priorityChart) {
+              priorityChart[item._id] = item.count;
+            }
           });
 
-          // ================= Recent Tickets =================
+          // =====================================================
+          // ================= RECENT TICKETS ===================
+          // =====================================================
 
           const recentTickets = await tickets
-            .find({
-              companyId,
-            })
-            .sort({
-              createdAt: -1,
-            })
-            .limit(3)
-            .toArray();
-
-          // ================= Urgent Tickets =================
-          const urgentTickets = await tickets
-            .find({
-              companyId,
-
-              status: {
-                $regex: "^open$",
-                $options: "i",
+            .aggregate([
+              {
+                $match: {
+                  companyId,
+                },
               },
 
-              "aiResult.states": {
-                $elemMatch: {
-                  title: {
-                    $regex: "^priority$",
-                    $options: "i",
+              // Current agent only
+              {
+                $match: currentAgentMatch,
+              },
+
+              {
+                $sort: {
+                  createdAt: -1,
+                },
+              },
+
+              {
+                $limit: 5,
+              },
+            ])
+            .toArray();
+
+          // =====================================================
+          // ================= URGENT TICKETS ====================
+          // =====================================================
+
+          const urgentTickets = await tickets
+            .aggregate([
+              {
+                $match: {
+                  companyId,
+
+                  status: {
+                    $regex: /^open$/i,
                   },
-                  value: {
-                    $regex: "^(high|critical)$",
-                    $options: "i",
+
+                  "aiResult.states": {
+                    $elemMatch: {
+                      title: {
+                        $regex: /^priority$/i,
+                      },
+                      value: {
+                        $regex: /^(high|critical)$/i,
+                      },
+                    },
                   },
                 },
               },
-            })
-            .sort({ createdAt: -1 })
-            .limit(3)
+
+              // Current agent only
+              {
+                $match: currentAgentMatch,
+              },
+
+              {
+                $sort: {
+                  createdAt: -1,
+                },
+              },
+
+              {
+                $limit: 3,
+              },
+            ])
             .toArray();
 
-          // ====================
+          // =====================================================
+          // ================= RESPONSE ==========================
+          // =====================================================
 
           return res.send({
             success: true,
+
             metrics: {
               assignedToMe,
               openCompanyTickets,
               inProgressTickets,
               resolvedToday,
             },
+
             statusChart,
+
             priorityChart,
+
             recentTickets,
+
             urgentTickets,
           });
         } catch (error) {
-          res.status(500).send({
+          console.error("Agent dashboard error:", error);
+
+          return res.status(500).send({
             success: false,
             message: error.message,
           });
@@ -917,7 +1511,7 @@ async function run() {
       },
     );
 
-    // ================= GET COMPANY TICKETS =================
+    // ================= GET COMPANY TICKETS =================================
     app.get(
       "/agent/company-tickets",
       verifyFirebaseToken,
@@ -933,12 +1527,12 @@ async function run() {
             limit = 10,
           } = req.query;
 
-          // company filter
+          // ================= COMPANY FILTER =================
           const queryData = {
             companyId: new ObjectId(req.agent.companyId),
           };
 
-          // Search
+          // ================= SEARCH =================
           if (search) {
             queryData.$or = [
               {
@@ -961,53 +1555,186 @@ async function run() {
               },
             ];
           }
-          // Status
+
+          // ================= STATUS =================
           if (status) {
             queryData.status = {
               $regex: new RegExp(`^${status}$`, "i"),
             };
           }
-          // Category
+
+          // ================= CATEGORY =================
           if (category) {
             queryData["aiResult.category"] = {
               $regex: new RegExp(`^${category}$`, "i"),
             };
           }
-          // Priority
+
+          // ================= PRIORITY =================
           if (priority) {
             queryData["aiResult.states"] = {
               $elemMatch: {
-                title: { $regex: /^priority$/i },
-                value: { $regex: new RegExp(`^${priority}$`, "i") },
+                title: {
+                  $regex: /^priority$/i,
+                },
+                value: {
+                  $regex: new RegExp(`^${priority}$`, "i"),
+                },
               },
             };
           }
 
-          // ======= pagination ========
-          const skip = (Number(page) - 1) * Number(limit);
+          // ================= PAGINATION =================
+          const pageNumber = Number(page);
+          const limitNumber = Number(limit);
+
+          const skip = (pageNumber - 1) * limitNumber;
+
+          // ================= TOTAL =================
           const total = await tickets.countDocuments(queryData);
 
+          // ================= GET TICKETS =================
           const result = await tickets
-            .find(queryData)
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(Number(limit))
+            .aggregate([
+              // -------- Filter --------
+              {
+                $match: queryData,
+              },
+
+              // -------- Latest tickets first --------
+              {
+                $sort: {
+                  createdAt: -1,
+                },
+              },
+
+              // -------- Pagination --------
+              {
+                $skip: skip,
+              },
+              {
+                $limit: limitNumber,
+              },
+
+              // =================================================
+              // GET AGENT INFORMATION FROM USERS
+              // =================================================
+              {
+                $lookup: {
+                  from: "users",
+                  localField: "agentHistory.uid",
+                  foreignField: "uid",
+                  as: "agentUsers",
+                },
+              },
+
+              // =================================================
+              // GET CUSTOMER / USER INFORMATION FROM USERS
+              // =================================================
+              {
+                $lookup: {
+                  from: "users",
+                  localField: "uid",
+                  foreignField: "uid",
+                  as: "userInfo",
+                },
+              },
+
+              // =================================================
+              // REQUIRED FIELDS ONLY
+              // =================================================
+              {
+                $project: {
+                  _id: 1,
+
+                  // ================= BASIC TICKET INFO =================
+                  companyId: 1,
+                  ticketNumber: 1,
+                  status: 1,
+                  aiResolved: 1,
+                  createdAt: 1,
+                  updatedAt: 1,
+                  agentHistory: 1,
+
+                  // ================= AI RESULT =================
+                  "aiResult.category": 1,
+                  "aiResult.states": 1,
+                  "aiResult.summary": 1,
+                  "aiResult.ticketTitle": 1,
+
+                  // ================= AGENT USERS =================
+                  agentUsers: {
+                    uid: 1,
+                    displayName: 1,
+                    name: 1,
+                    email: 1,
+                    photoURL: 1,
+                    role: 1,
+                  },
+
+                  // ================= CUSTOMER USER =================
+                  userInfo: {
+                    uid: 1,
+                    displayName: 1,
+                    name: 1,
+                    email: 1,
+                    photoURL: 1,
+                    role: 1,
+                  },
+                },
+              },
+            ])
             .toArray();
 
-          console.log(queryData);
-          console.log(result);
+          // =================================================
+          // FORMAT FINAL RESULT
+          // =================================================
+          const finalResult = result.map((ticket) => {
+            // ================= CURRENT AGENT =================
+            const currentAgentUid = getCurrentAgentUid(
+              ticket.agentHistory || [],
+            );
+
+            // Find current agent
+            const currentAgent = currentAgentUid
+              ? ticket.agentUsers?.find(
+                  (agent) => agent.uid === currentAgentUid,
+                )
+              : null;
+
+            // ================= CURRENT USER =================
+            // $lookup returns array, but we need single object
+            const currentUser = ticket.userInfo?.[0] || null;
+
+            // Remove temporary lookup fields
+            const { agentUsers, userInfo, ...ticketWithoutLookup } = ticket;
+
+            return {
+              ...ticketWithoutLookup,
+
+              // Single agent object
+              agentInfo: currentAgent || null,
+
+              // Single user/customer object
+              userInfo: currentUser,
+            };
+          });
+
+          // ================= RESPONSE =================
           return res.send({
             success: true,
-            data: result,
-            currentAgent: req.agent.email,
+            data: finalResult,
+
             pagination: {
               total,
-              page: Number(page),
-              limit: Number(limit),
-              totalPages: Math.ceil(total / limit),
+              page: pageNumber,
+              limit: limitNumber,
+              totalPages: Math.ceil(total / limitNumber),
             },
           });
         } catch (error) {
+          console.error("GET COMPANY TICKETS ERROR:", error);
+
           return res.status(500).send({
             success: false,
             message: error.message,
@@ -1016,7 +1743,7 @@ async function run() {
       },
     );
 
-    // ================= GET AGENT ASSIGNED TICKETS =================
+    // ================= GET ASSIGNED TICKETS TO AGENT ========================
     app.get(
       "/agent/assigned-tickets",
       verifyFirebaseToken,
@@ -1032,6 +1759,7 @@ async function run() {
             limit = 10,
           } = req.query;
 
+          // ================= VALIDATE COMPANY =================
           if (!req.agent.companyId || !ObjectId.isValid(req.agent.companyId)) {
             return res.status(400).send({
               success: false,
@@ -1039,12 +1767,41 @@ async function run() {
             });
           }
 
+          const companyId = new ObjectId(req.agent.companyId);
+
+          const pageNumber = Number(page);
+          const limitNumber = Number(limit);
+          const skip = (pageNumber - 1) * limitNumber;
+
+          // ================= BASE QUERY =================
+          // Only show ticket when the LATEST agentHistory
+          // belongs to current agent AND action is "assigned"
           const queryData = {
-            companyId: new ObjectId(req.agent.companyId),
-            "assignedAgent.email": req.agent.email,
+            companyId,
+
+            $expr: {
+              $let: {
+                vars: {
+                  latestHistory: {
+                    $arrayElemAt: ["$agentHistory", -1],
+                  },
+                },
+
+                in: {
+                  $and: [
+                    {
+                      $eq: ["$$latestHistory.uid", req.agent.uid],
+                    },
+                    {
+                      $eq: ["$$latestHistory.action", "assigned"],
+                    },
+                  ],
+                },
+              },
+            },
           };
 
-          // Search
+          // ================= SEARCH =================
           if (search) {
             queryData.$or = [
               {
@@ -1068,21 +1825,21 @@ async function run() {
             ];
           }
 
-          // Status
+          // ================= STATUS =================
           if (status) {
             queryData.status = {
               $regex: new RegExp(`^${status}$`, "i"),
             };
           }
 
-          // Category
+          // ================= CATEGORY =================
           if (category) {
             queryData["aiResult.category"] = {
               $regex: new RegExp(`^${category}$`, "i"),
             };
           }
 
-          // Priority
+          // ================= PRIORITY =================
           if (priority) {
             queryData["aiResult.states"] = {
               $elemMatch: {
@@ -1096,27 +1853,108 @@ async function run() {
             };
           }
 
-          // Pagination
-          const pageNumber = Number(page);
-          const limitNumber = Number(limit);
-          const skip = (pageNumber - 1) * limitNumber;
-
+          // ================= TOTAL =================
           const total = await tickets.countDocuments(queryData);
 
+          // ================= GET TICKETS =================
           const result = await tickets
-            .find(queryData)
-            .sort({
-              updatedAt: -1,
-              createdAt: -1,
-            })
-            .skip(skip)
-            .limit(limitNumber)
+            .aggregate([
+              // -------- Filter --------
+              {
+                $match: queryData,
+              },
+
+              // -------- Latest updated tickets first --------
+              {
+                $sort: {
+                  updatedAt: -1,
+                  createdAt: -1,
+                },
+              },
+
+              // -------- Pagination --------
+              {
+                $skip: skip,
+              },
+              {
+                $limit: limitNumber,
+              },
+
+              // =================================================
+              // GET CUSTOMER INFO FROM USERS
+              // ticket.uid === users.uid
+              // =================================================
+              {
+                $lookup: {
+                  from: "users",
+                  localField: "uid",
+                  foreignField: "uid",
+                  as: "userInfo",
+                },
+              },
+
+              // =================================================
+              // PROJECT ONLY REQUIRED DATA
+              // =================================================
+              {
+                $project: {
+                  _id: 1,
+
+                  // ================= BASIC =================
+                  uid: 1,
+                  companyId: 1,
+                  ticketNumber: 1,
+                  status: 1,
+                  aiResolved: 1,
+                  createdAt: 1,
+                  updatedAt: 1,
+
+                  // ================= AI RESULT =================
+                  "aiResult.category": 1,
+                  "aiResult.states": 1,
+                  "aiResult.summary": 1,
+                  "aiResult.ticketTitle": 1,
+
+                  // ================= USER INFO =================
+                  userInfo: {
+                    uid: 1,
+                    displayName: 1,
+                    name: 1,
+                    email: 1,
+                    photoURL: 1,
+                    role: 1,
+                  },
+                },
+              },
+            ])
             .toArray();
 
+          // =================================================
+          // FORMAT FINAL RESULT
+          // =================================================
+          const finalResult = result.map((ticket) => {
+            return {
+              ...ticket,
+
+              // $lookup returns array
+              // Convert to single user object
+              userInfo: ticket.userInfo?.[0] || null,
+
+              // Current logged-in agent
+              agentInfo: {
+                uid: req.agent.uid,
+                email: req.agent.email,
+                displayName: req.agent.displayName || req.agent.name || "Agent",
+              },
+            };
+          });
+
+          // ================= RESPONSE =================
           return res.send({
             success: true,
-            data: result,
-            currentAgent: req.agent.email,
+
+            data: finalResult,
+
             pagination: {
               total,
               page: pageNumber,
@@ -1129,147 +1967,30 @@ async function run() {
 
           return res.status(500).send({
             success: false,
-            message: error.message,
+            message: "Failed to fetch assigned tickets",
           });
         }
       },
     );
 
-    // =============== HANDLE TO ASSIGN TICKET =================
-// ================= ASSIGN TICKET TO AGENT =================
-app.patch(
-  "/agent/tickets/:id/assign",
-  verifyFirebaseToken,
-  verifyAgent,
-  async (req, res) => {
-    try {
-      const { id } = req.params;
-
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({
-          success: false,
-          message: "Invalid ticket id",
-        });
-      }
-
-      if (
-        !req.agent.companyId ||
-        !ObjectId.isValid(req.agent.companyId)
-      ) {
-        return res.status(400).send({
-          success: false,
-          message: "Agent company information is invalid",
-        });
-      }
-
-      const ticketId = new ObjectId(id);
-      const companyId = new ObjectId(req.agent.companyId);
-      const assignedAt = new Date();
-
-      const assignedAgent = {
-        uid: req.agent.uid,
-        email: req.agent.email,
-        displayName: req.agent.displayName,
-      };
-
-      const result = await tickets.updateOne(
-        {
-          _id: ticketId,
-          companyId,
-          status: "open",
-          assignedAgent: { $exists: false },
-        },
-        {
-          $set: {
-            assignedAgent,
-            status: "assigned",
-            assignedAt,
-            updatedAt: assignedAt,
-          },
-          $push: {
-            assignmentHistory: {
-              action: "assigned",
-              agent: assignedAgent,
-              createdAt: assignedAt,
-            },
-          },
-        },
-      );
-
-      if (result.matchedCount === 0) {
-        return res.status(409).send({
-          success: false,
-          message:
-            "Ticket is already assigned, unavailable, or does not belong to your company",
-        });
-      }
-
-      const ticket = await tickets.findOne({
-        _id: ticketId,
-        companyId,
-      });
-
-      try {
-        await createNotification({
-          uid: ticket.uid,
-          userEmail: ticket.email,
-          title: "Ticket Assigned",
-          message: `Your ticket ${ticket.ticketNumber} has been assigned to ${req.agent.displayName}.`,
-          type: "ticket_assigned",
-          ticketId: ticket._id,
-          ticketNumber: ticket.ticketNumber,
-          path: "/customer/my-tickets",
-        });
-
-        await createNotification({
-          uid: req.agent.uid,
-          userEmail: req.agent.email,
-          title: "Ticket Claimed",
-          message: `You claimed ticket ${ticket.ticketNumber}.`,
-          type: "ticket_claimed",
-          ticketId: ticket._id,
-          ticketNumber: ticket.ticketNumber,
-          path: `/agent/tickets/${ticket._id}`,
-        });
-      } catch (notificationError) {
-        console.error(
-          "Ticket assignment notification error:",
-          notificationError.message,
-        );
-      }
-
-      return res.send({
-        success: true,
-        message: "Ticket assigned successfully",
-        data: ticket,
-      });
-    } catch (error) {
-      console.error("Assign ticket error:", error);
-
-      return res.status(500).send({
-        success: false,
-        message: error.message,
-      });
-    }
-  },
-);
-
-    // ================= RETURN TICKET TO COMPANY QUEUE =================
+    // ================= UPDATE ASSIGN TICKET TO AGENT =======================
     app.patch(
-      "/agent/tickets/:id/release",
+      "/agent/tickets/:id/assign",
       verifyFirebaseToken,
       verifyAgent,
       async (req, res) => {
         try {
-          const ticketId = req.params.id;
+          const { id } = req.params;
 
-          if (!ObjectId.isValid(ticketId)) {
+          // ================= VALIDATE TICKET ID =================
+          if (!ObjectId.isValid(id)) {
             return res.status(400).send({
               success: false,
               message: "Invalid ticket id",
             });
           }
 
+          // ================= VALIDATE COMPANY =================
           if (!req.agent.companyId || !ObjectId.isValid(req.agent.companyId)) {
             return res.status(400).send({
               success: false,
@@ -1277,76 +1998,277 @@ app.patch(
             });
           }
 
+          const ticketId = new ObjectId(id);
           const companyId = new ObjectId(req.agent.companyId);
-          const ticketObjectId = new ObjectId(ticketId);
-          const releasedAt = new Date();
+          const assignedAt = new Date();
 
+          // ================= FIND TICKET =================
+          const ticket = await tickets.findOne({
+            _id: ticketId,
+            companyId,
+          });
+
+          if (!ticket) {
+            return res.status(404).send({
+              success: false,
+              message: "Ticket not found",
+            });
+          }
+
+          // ================= GET CURRENT AGENT =================
+          const currentAgentUid = getCurrentAgentUid(ticket.agentHistory || []);
+
+          console.log(currentAgentUid);
+
+          // ================= ALREADY ASSIGNED =================
+          if (currentAgentUid) {
+            return res.status(409).send({
+              success: false,
+              message: "This ticket is already assigned to an agent",
+            });
+          }
+
+          // ================= CHECK STATUS =================
+          if (ticket.status !== "open") {
+            return res.status(409).send({
+              success: false,
+              message: "Only open tickets can be assigned to an agent",
+            });
+          }
+
+          // ================= ASSIGN TICKET =================
           const result = await tickets.updateOne(
             {
-              _id: ticketObjectId,
+              _id: ticketId,
               companyId,
-              "assignedAgent.email": req.agent.email,
-              status: {
-                $in: ["assigned", "in_progress"],
-              },
+              status: "open",
             },
             {
-              $unset: {
-                assignedAgent: "",
-              },
               $set: {
-                status: "open",
-                updatedAt: releasedAt,
+                status: "assigned",
+                updatedAt: assignedAt,
               },
+
               $push: {
-                assignmentHistory: {
-                  action: "released",
-                  agent: {
-                    uid: req.agent.uid,
-                    email: req.agent.email,
-                    displayName: req.agent.displayName,
-                  },
-                  createdAt: releasedAt,
+                agentHistory: {
+                  uid: req.agent.uid,
+                  action: "assigned",
+                  date: assignedAt,
                 },
               },
             },
           );
 
-          if (result.matchedCount === 0) {
-            return res.status(404).send({
+          // ================= UPDATE FAILED =================
+          if (result.modifiedCount === 0) {
+            return res.status(409).send({
               success: false,
               message:
-                "Ticket not found, already released, or not assigned to you",
+                "Ticket could not be assigned. It may have already been assigned or updated.",
             });
           }
 
-          const ticket = await tickets.findOne({
-            _id: ticketObjectId,
+          // ================= GET UPDATED TICKET =================
+          const updatedTicket = await tickets.findOne({
+            _id: ticketId,
             companyId,
           });
 
-          // Notification
+          if (!updatedTicket) {
+            return res.status(404).send({
+              success: false,
+              message: "Ticket not found after assignment",
+            });
+          }
+
+          // ================= NOTIFICATIONS =================
           try {
+            // -------- Customer notification --------
             await createNotification({
-              uid: ticket.uid,
-              userEmail: ticket.email,
-              title: "Ticket Returned to Support Queue",
-              message: `Your ticket ${ticket.ticketNumber} has been returned to the support queue and will be assigned to another available agent.`,
-              type: "ticket_released",
-              ticketId: ticket._id,
-              ticketNumber: ticket.ticketNumber,
-              path: "/customer/tickets",
+              uid: updatedTicket.uid,
+              userEmail: updatedTicket.email,
+              title: "Ticket Assigned to Support Agent",
+              message: `Your ticket ${updatedTicket.ticketNumber} has been assigned to a support agent. They will review your issue and assist you shortly.`,
+              type: "ticket_assigned",
+              ticketId: updatedTicket._id,
+              ticketNumber: updatedTicket.ticketNumber,
+              path: "/customer/my-tickets",
             });
 
+            // -------- Agent notification --------
+            await createNotification({
+              uid: req.agent.uid,
+              userEmail: req.agent.email,
+              title: "Ticket Assigned to You",
+              message: `Ticket ${updatedTicket.ticketNumber} has been assigned to you.`,
+              type: "ticket_assigned",
+              ticketId: updatedTicket._id,
+              ticketNumber: updatedTicket.ticketNumber,
+              path: `/agent/tickets/${updatedTicket._id}`,
+            });
+          } catch (notificationError) {
+            console.error(
+              "Ticket assignment notification error:",
+              notificationError.message,
+            );
+          }
+
+          // ================= RESPONSE =================
+          return res.send({
+            success: true,
+            message: "Ticket assigned successfully",
+            data: updatedTicket,
+          });
+        } catch (error) {
+          console.error("Assign ticket error:", error);
+
+          return res.status(500).send({
+            success: false,
+            message: "Failed to assign ticket",
+          });
+        }
+      },
+    );
+
+    // ================= UPDATE RELEASE TICKET TO COMPANY ====================
+    app.patch(
+      "/agent/tickets/:id/release",
+      verifyFirebaseToken,
+      verifyAgent,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+
+          // ================= VALIDATE TICKET ID =================
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+              success: false,
+              message: "Invalid ticket id",
+            });
+          }
+
+          // ================= VALIDATE COMPANY =================
+          if (!req.agent.companyId || !ObjectId.isValid(req.agent.companyId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Agent company information is invalid",
+            });
+          }
+
+          const ticketId = new ObjectId(id);
+          const companyId = new ObjectId(req.agent.companyId);
+          const releasedAt = new Date();
+
+          // ================= FIND TICKET =================
+          const ticket = await tickets.findOne({
+            _id: ticketId,
+            companyId,
+          });
+
+          if (!ticket) {
+            return res.status(404).send({
+              success: false,
+              message: "Ticket not found",
+            });
+          }
+
+          // ================= GET CURRENT AGENT =================
+          const currentAgentUid = getCurrentAgentUid(ticket.agentHistory || []);
+
+          // ================= CHECK CURRENT AGENT =================
+          if (!currentAgentUid) {
+            return res.status(409).send({
+              success: false,
+              message: "This ticket is not currently assigned to any agent",
+            });
+          }
+
+          if (currentAgentUid !== req.agent.uid) {
+            return res.status(403).send({
+              success: false,
+              message: "You are not the current agent of this ticket",
+            });
+          }
+
+          // ================= CHECK STATUS =================
+          if (!["assigned", "in_progress"].includes(ticket.status)) {
+            return res.status(409).send({
+              success: false,
+              message: "This ticket cannot be released in its current status",
+            });
+          }
+
+          // ================= RELEASE TICKET =================
+          const result = await tickets.updateOne(
+            {
+              _id: ticketId,
+              companyId,
+              status: {
+                $in: ["assigned", "in_progress"],
+              },
+            },
+            {
+              $set: {
+                status: "open",
+                updatedAt: releasedAt,
+              },
+
+              $push: {
+                agentHistory: {
+                  uid: req.agent.uid,
+                  action: "released",
+                  date: releasedAt,
+                },
+              },
+            },
+          );
+
+          // ================= UPDATE FAILED =================
+          if (result.modifiedCount === 0) {
+            return res.status(409).send({
+              success: false,
+              message:
+                "Ticket could not be released. It may have already been updated.",
+            });
+          }
+
+          // ================= GET UPDATED TICKET =================
+          const updatedTicket = await tickets.findOne({
+            _id: ticketId,
+            companyId,
+          });
+
+          if (!updatedTicket) {
+            return res.status(404).send({
+              success: false,
+              message: "Ticket not found after release",
+            });
+          }
+
+          // ================= NOTIFICATIONS =================
+          try {
+            // Customer notification
+            await createNotification({
+              uid: updatedTicket.uid,
+              userEmail: updatedTicket.email,
+              title: "Ticket Returned to Support Queue",
+              message: `Your ticket ${updatedTicket.ticketNumber} has been returned to the support queue and will be assigned to another available agent.`,
+              type: "ticket_released",
+              ticketId: updatedTicket._id,
+              ticketNumber: updatedTicket.ticketNumber,
+              path: "/customer/my-tickets",
+            });
+
+            // Current agent notification
             await createNotification({
               uid: req.agent.uid,
               userEmail: req.agent.email,
               title: "Ticket Returned to Queue",
-              message: `You returned ticket ${ticket.ticketNumber} to the company queue.`,
+              message: `You returned ticket ${updatedTicket.ticketNumber} to the company queue.`,
               type: "ticket_returned",
-              ticketId: ticket._id,
-              ticketNumber: ticket.ticketNumber,
-              path: "/agent/company-tickets",
+              ticketId: updatedTicket._id,
+              ticketNumber: updatedTicket.ticketNumber,
+              path: `/agent/tickets/${updatedTicket._id}`,
             });
           } catch (notificationError) {
             console.error(
@@ -1355,23 +2277,24 @@ app.patch(
             );
           }
 
+          // ================= RESPONSE =================
           return res.send({
             success: true,
             message: "Ticket returned to company queue successfully",
-            data: ticket,
+            data: updatedTicket,
           });
         } catch (error) {
           console.error("Release ticket error:", error);
 
           return res.status(500).send({
             success: false,
-            message: error.message,
+            message: "Failed to release ticket",
           });
         }
       },
     );
 
-    //  ============ notification ==============
+    //  ============================================ notification ===================================================
     app.get("/notifications", verifyFirebaseToken, async (req, res) => {
       try {
         const uid = req.user.uid;
@@ -1431,6 +2354,7 @@ app.patch(
         });
       }
     });
+
     // ================ PATCH /notifications/read-all =================
     app.patch(
       "/notifications/read-all",
@@ -1463,7 +2387,7 @@ app.patch(
       },
     );
 
-    // ================================================ AI ANALYZE TICKET ==========================================
+    // ================================================ AI ANALYZE TICKET ===========================================
     app.post("/ai/analyze-ticket", verifyFirebaseToken, async (req, res) => {
       try {
         const { description, attachments } = req.body;
@@ -1804,6 +2728,135 @@ app.patch(
     );
 
     // ==================================================================================
+    // ======================== AI SUGGEST REPLY FOR AGENT =============================
+
+    app.post(
+      "/ai/suggest-reply",
+      verifyFirebaseToken,
+      verifyAgent,
+      async (req, res) => {
+        try {
+          const { ticketId } = req.body;
+
+          // ================= VALIDATION =================
+
+          if (!ticketId) {
+            return res.status(400).send({
+              success: false,
+              message: "ticketId is required",
+            });
+          }
+
+          if (!ObjectId.isValid(ticketId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Invalid ticket id",
+            });
+          }
+
+          // ================= FIND TICKET =================
+
+          const ticket = await tickets.findOne({
+            _id: new ObjectId(ticketId),
+          });
+
+          if (!ticket) {
+            return res.status(404).send({
+              success: false,
+              message: "Ticket not found",
+            });
+          }
+
+          // ================= SECURITY =================
+          // Agent must belong to same company
+
+          if (
+            !ticket.companyId ||
+            ticket.companyId.toString() !== req.agent.companyId.toString()
+          ) {
+            return res.status(403).send({
+              success: false,
+              message: "You don't have permission to access this ticket",
+            });
+          }
+
+          // ================= ASSIGNED AGENT CHECK =================
+          // Only assigned agent can generate reply
+
+          if (
+            ticket.assignedAgent?.uid &&
+            ticket.assignedAgent.uid !== req.agent.uid
+          ) {
+            return res.status(403).send({
+              success: false,
+              message: "This ticket is assigned to another agent",
+            });
+          }
+
+          // ================= CUSTOMER =================
+
+          const customer = await users.findOne({
+            uid: ticket.uid,
+          });
+
+          if (!customer) {
+            return res.status(404).send({
+              success: false,
+              message: "Customer not found",
+            });
+          }
+
+          // ================= AI RESULT =================
+
+          const aiResult = ticket.aiResult;
+
+          if (!aiResult) {
+            return res.status(400).send({
+              success: false,
+              message: "AI analysis is not available for this ticket",
+            });
+          }
+
+          // ================= CONVERSATION =================
+          const conversations = [];
+
+          // ================= AGENT =================
+          const agent = {
+            uid: req.agent.uid,
+            displayName: req.agent.displayName,
+            email: req.agent.email,
+            role: "agent",
+          };
+
+          // ================= AI =================
+
+          const result = await suggestAgentReply({
+            ticket,
+            customer,
+            aiResult,
+            conversations,
+            agent,
+          });
+
+          // ================= RESPONSE =================
+
+          return res.send({
+            success: true,
+            data: {
+              reply: result.reply,
+            },
+            meta: result.meta,
+          });
+        } catch (error) {
+          console.error("Suggest reply error:", error);
+
+          return res.status(500).send({
+            success: false,
+            message: error.message || "Failed to generate suggested reply",
+          });
+        }
+      },
+    );
     // ==================================================================================
     // ==================================================================================
     // ==================================================================================

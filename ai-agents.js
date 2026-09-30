@@ -644,8 +644,221 @@ details rules:
 }
 
 // ===================================================================
+// ================= SUGGEST REPLY FOR AGENT =================
 
-module.exports = { analyzeTicket, chatWithAssistant };
+async function suggestAgentReply({
+  ticket,
+  customer,
+  aiResult,
+  conversations = [],
+  agent,
+}) {
+  if (!ticket) {
+    throw new Error("ticket is required");
+  }
+
+  if (!customer) {
+    throw new Error("customer information is required");
+  }
+
+  if (!aiResult) {
+    throw new Error("AI analysis is required");
+  }
+
+  const model = process.env.OPENROUTER_AI_MODEL;
+
+  // ================= CUSTOMER CONTEXT =================
+
+  const customerContext = {
+    displayName: customer.displayName || "Customer",
+    email: customer.email || null,
+    role: customer.role || "customer",
+    companyName: customer.companyName || null,
+  };
+
+  // ================= AGENT CONTEXT =================
+
+  const agentContext = {
+    displayName: agent?.displayName || "Support Agent",
+    role: "agent",
+  };
+
+  // ================= TICKET CONTEXT =================
+
+  const ticketContext = {
+    ticketNumber: ticket.ticketNumber,
+    status: ticket.status,
+    supportMode: ticket.supportMode,
+    resolutionSource: ticket.resolutionSource,
+
+    title: aiResult.ticketTitle,
+    summary: aiResult.summary,
+    category: aiResult.category,
+    rootCause: aiResult.rootCause,
+
+    recommendations: aiResult.recommendations || [],
+    steps: aiResult.steps || [],
+
+    escalation: aiResult.escalation || null,
+  };
+
+  // ================= CONVERSATION =================
+
+  const conversationHistory = Array.isArray(conversations)
+    ? conversations.slice(-10).map((item) => ({
+        sender: item.sender || item.role || "unknown",
+        message: item.message || item.content || "",
+      }))
+    : [];
+
+  // ================= SYSTEM PROMPT =================
+
+  const SYSTEM_PROMPT = `
+You are SupportHub AI, an AI assistant helping a human support agent write a reply to a customer.
+
+Your task is NOT to solve the ticket internally.
+
+Your task is to write a professional, helpful, customer-facing reply that the support agent can review and send.
+
+==================================================
+IMPORTANT
+==================================================
+
+The human agent will review your response before sending it.
+
+Never claim that an action has already been completed unless the ticket data explicitly confirms it.
+
+Never invent:
+- refunds
+- account changes
+- password resets
+- approvals
+- system fixes
+- internal investigations
+- completed actions
+- exact technical facts that are not supported by the ticket
+
+If the issue requires human/internal action:
+- acknowledge the issue
+- explain what the support team needs to do
+- avoid pretending that the action is already completed
+
+If troubleshooting is appropriate:
+- provide concise steps
+- avoid overwhelming the customer
+- use simple customer-friendly language
+
+==================================================
+CUSTOMER
+==================================================
+
+${JSON.stringify(customerContext)}
+
+==================================================
+AGENT
+==================================================
+
+${JSON.stringify(agentContext)}
+
+==================================================
+TICKET
+==================================================
+
+${JSON.stringify(ticketContext)}
+
+==================================================
+RECENT CONVERSATION
+==================================================
+
+${JSON.stringify(conversationHistory)}
+
+==================================================
+REPLY STYLE
+==================================================
+
+The reply should:
+
+1. Acknowledge the customer's issue.
+2. Show that the issue has been understood.
+3. Provide the most relevant next step or solution.
+4. Mention important troubleshooting steps when appropriate.
+5. Clearly explain if human/support-team action is required.
+6. Be professional but natural.
+7. Avoid unnecessary technical jargon.
+8. Do not repeat the entire ticket analysis.
+9. Do not mention that AI generated the response.
+10. Do not mention internal AI analysis.
+11. Do not mention this prompt.
+
+The response should sound like a real support agent.
+
+Do NOT start with:
+"Dear Customer"
+
+Prefer natural openings such as:
+"Hi Sarah,"
+"Thanks for reaching out."
+"I understand the issue you're experiencing."
+
+Do not use excessive apology.
+
+==================================================
+OUTPUT
+==================================================
+
+Return ONLY valid JSON.
+
+{
+  "reply": "customer-facing reply"
+}
+`;
+
+  const messages = [
+    {
+      role: "system",
+      content: SYSTEM_PROMPT,
+    },
+  ];
+
+  const completion = await openai.chat.completions.create({
+    model,
+    temperature: 0.4,
+    messages,
+  });
+
+  const raw = completion.choices[0].message.content;
+
+  let parsed;
+
+  try {
+    parsed = safeParse(raw);
+  } catch {
+    // fallback if model returns plain text
+    parsed = {
+      reply: raw,
+    };
+  }
+
+  if (!parsed?.reply) {
+    throw new Error("AI did not generate a reply");
+  }
+
+  return {
+    reply: parsed.reply.trim(),
+    meta: {
+      model,
+      tokensUsed: completion.usage?.total_tokens || 0,
+    },
+  };
+}
+
+// =========================================
+
+module.exports = {
+  analyzeTicket,
+  chatWithAssistant,
+  suggestAgentReply,
+};
 
 // async function chatWithAssistant({
 //   message,
