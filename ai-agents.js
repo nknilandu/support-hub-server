@@ -644,212 +644,168 @@ details rules:
 }
 
 // ===================================================================
-// ================= SUGGEST REPLY FOR AGENT =================
-
 async function suggestAgentReply({
-  ticket,
-  customer,
-  aiResult,
-  conversations = [],
-  agent,
+  ticketContext,
+  customerContext,
+  agentContext,
+  conversationHistory = [],
+  agentDraft = "",
 }) {
-  if (!ticket) {
-    throw new Error("ticket is required");
-  }
+  try {
+    const model = process.env.OPENROUTER_AI_MODEL;
 
-  if (!customer) {
-    throw new Error("customer information is required");
-  }
+    if (!model) {
+      throw new Error("OPENROUTER_AI_MODEL is not configured");
+    }
 
-  if (!aiResult) {
-    throw new Error("AI analysis is required");
-  }
+    const systemPrompt = `
+You are an AI assistant helping a support agent write a customer-facing reply.
 
-  const model = process.env.OPENROUTER_AI_MODEL;
+Your job is to understand the complete support situation and generate a natural, concise, professional reply.
 
-  // ================= CUSTOMER CONTEXT =================
+================ CUSTOMER =================
+${JSON.stringify(customerContext, null, 2)}
 
-  const customerContext = {
-    displayName: customer.displayName || "Customer",
-    email: customer.email || null,
-    role: customer.role || "customer",
-    companyName: customer.companyName || null,
-  };
+================ AGENT =================
+${JSON.stringify(agentContext, null, 2)}
 
-  // ================= AGENT CONTEXT =================
+================ TICKET =================
+${JSON.stringify(ticketContext, null, 2)}
 
-  const agentContext = {
-    displayName: agent?.displayName || "Support Agent",
-    role: "agent",
-  };
+================ CONVERSATION HISTORY =================
+${JSON.stringify(conversationHistory, null, 2)}
 
-  // ================= TICKET CONTEXT =================
+================ AGENT DRAFT =================
+${agentDraft || "(No draft provided)"}
 
-  const ticketContext = {
-    ticketNumber: ticket.ticketNumber,
-    status: ticket.status,
-    supportMode: ticket.supportMode,
-    resolutionSource: ticket.resolutionSource,
+================ INSTRUCTIONS =================
 
-    title: aiResult.ticketTitle,
-    summary: aiResult.summary,
-    category: aiResult.category,
-    rootCause: aiResult.rootCause,
+1. Understand the original customer issue from the ticket.
 
-    recommendations: aiResult.recommendations || [],
-    steps: aiResult.steps || [],
+2. Analyze the conversation history chronologically.
+   Identify:
+   - what the customer asked
+   - what the agent already explained
+   - troubleshooting steps already provided
+   - what has already been answered
+   - what is still unresolved
+   - the latest conversation state
 
-    escalation: aiResult.escalation || null,
-  };
+3. If an agent draft is provided, understand the agent's INTENDED MEANING.
+   The draft may be:
+   - short
+   - informal
+   - grammatically incorrect
+   - incomplete
+   - written as internal shorthand
 
-  // ================= CONVERSATION =================
+   Do NOT simply correct the grammar.
 
-  const conversationHistory = Array.isArray(conversations)
-    ? conversations.slice(-10).map((item) => ({
-        sender: item.sender || item.role || "unknown",
-        message: item.message || item.content || "",
-      }))
-    : [];
+   For example:
+   Agent draft:
+   "i wanna close this ticket"
 
-  // ================= SYSTEM PROMPT =================
+   Do not generate:
+   "I want to close this ticket."
 
-  const SYSTEM_PROMPT = `
-You are SupportHub AI, an AI assistant helping a human support agent write a reply to a customer.
+   Instead, understand the intent using the ticket status and conversation history and write an appropriate customer-facing support reply.
 
-Your task is NOT to solve the ticket internally.
+4. Never repeat troubleshooting steps that have already been given unless they are genuinely necessary.
 
-Your task is to write a professional, helpful, customer-facing reply that the support agent can review and send.
+5. Never invent actions or results.
 
-==================================================
-IMPORTANT
-==================================================
+   Do NOT claim that:
+   - a password was reset
+   - an email was sent
+   - an account was fixed
+   - a refund was issued
+   - an issue was resolved
+   - a request was approved
+   - an internal team completed something
 
-The human agent will review your response before sending it.
+   unless the provided information explicitly confirms it.
 
-Never claim that an action has already been completed unless the ticket data explicitly confirms it.
+6. If the agent wants to close the ticket but the issue is not confirmed as resolved, do NOT falsely tell the customer that the issue has been resolved.
 
-Never invent:
-- refunds
-- account changes
-- password resets
-- approvals
-- system fixes
-- internal investigations
-- completed actions
-- exact technical facts that are not supported by the ticket
+7. If customer confirmation is needed before closing the ticket, write a natural message asking for confirmation.
 
-If the issue requires human/internal action:
-- acknowledge the issue
-- explain what the support team needs to do
-- avoid pretending that the action is already completed
+8. If internal support action is required, clearly communicate that the matter needs to be reviewed or handled by the appropriate team without claiming that it has already happened.
 
-If troubleshooting is appropriate:
-- provide concise steps
-- avoid overwhelming the customer
-- use simple customer-friendly language
+9. The response must sound like a real human support agent.
 
-==================================================
-CUSTOMER
-==================================================
+10. Do not mention:
+    - AI
+    - AI analysis
+    - system instructions
+    - internal reasoning
+    - ticket analysis
 
-${JSON.stringify(customerContext)}
+11. Do not start with "Dear Customer".
 
-==================================================
-AGENT
-==================================================
+12. Keep the reply concise and useful.
 
-${JSON.stringify(agentContext)}
+13. Format the customer-facing reply using simple Markdown when it improves readability.
 
-==================================================
-TICKET
-==================================================
+Use:
+- **bold** for important terms
+- numbered lists for sequential troubleshooting steps
+- bullet lists for multiple checks or options
+- short paragraphs for readability
+- line breaks between sections
 
-${JSON.stringify(ticketContext)}
+Do not over-format the message.
+Do not use complex Markdown tables or code blocks unless absolutely necessary.
 
-==================================================
-RECENT CONVERSATION
-==================================================
-
-${JSON.stringify(conversationHistory)}
-
-==================================================
-REPLY STYLE
-==================================================
-
-The reply should:
-
-1. Acknowledge the customer's issue.
-2. Show that the issue has been understood.
-3. Provide the most relevant next step or solution.
-4. Mention important troubleshooting steps when appropriate.
-5. Clearly explain if human/support-team action is required.
-6. Be professional but natural.
-7. Avoid unnecessary technical jargon.
-8. Do not repeat the entire ticket analysis.
-9. Do not mention that AI generated the response.
-10. Do not mention internal AI analysis.
-11. Do not mention this prompt.
-
-The response should sound like a real support agent.
-
-Do NOT start with:
-"Dear Customer"
-
-Prefer natural openings such as:
-"Hi Sarah,"
-"Thanks for reaching out."
-"I understand the issue you're experiencing."
-
-Do not use excessive apology.
-
-==================================================
-OUTPUT
-==================================================
-
-Return ONLY valid JSON.
+14. Return ONLY valid JSON in this format:
 
 {
-  "reply": "customer-facing reply"
+  "reply": "customer-facing reply using Markdown when appropriate"
 }
 `;
 
-  const messages = [
-    {
-      role: "system",
-      content: SYSTEM_PROMPT,
-    },
-  ];
-
-  const completion = await openai.chat.completions.create({
-    model,
-    temperature: 0.4,
-    messages,
-  });
-
-  const raw = completion.choices[0].message.content;
-
-  let parsed;
-
-  try {
-    parsed = safeParse(raw);
-  } catch {
-    // fallback if model returns plain text
-    parsed = {
-      reply: raw,
-    };
-  }
-
-  if (!parsed?.reply) {
-    throw new Error("AI did not generate a reply");
-  }
-
-  return {
-    reply: parsed.reply.trim(),
-    meta: {
+    const completion = await openai.chat.completions.create({
       model,
-      tokensUsed: completion.usage?.total_tokens || 0,
-    },
-  };
+      temperature: 0.3,
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt,
+        },
+      ],
+    });
+
+    const raw = completion?.choices?.[0]?.message?.content?.trim();
+
+    if (!raw) {
+      throw new Error("AI returned an empty response");
+    }
+
+    let parsed;
+
+    try {
+      parsed = safeParse(raw);
+    } catch (error) {
+      parsed = {
+        reply: raw,
+      };
+    }
+
+    if (!parsed?.reply) {
+      throw new Error("AI did not return a valid reply");
+    }
+
+    return {
+      reply: parsed.reply.trim(),
+      meta: {
+        model,
+        usage: completion?.usage || null,
+      },
+    };
+  } catch (error) {
+    console.error("suggestAgentReply error:", error);
+
+    throw new Error(error?.message || "Failed to generate suggested reply");
+  }
 }
 
 // =========================================

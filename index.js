@@ -3204,14 +3204,13 @@ async function run() {
 
     // ==================================================================================
     // ======================== AI SUGGEST REPLY FOR AGENT =============================
-
     app.post(
       "/ai/suggest-reply",
       verifyFirebaseToken,
       verifyAgent,
       async (req, res) => {
         try {
-          const { ticketId } = req.body;
+          const { ticketId, agentDraft = "" } = req.body;
 
           // ================= VALIDATION =================
 
@@ -3242,9 +3241,7 @@ async function run() {
             });
           }
 
-          // ================= SECURITY =================
-          // Agent must belong to same company
-
+          // ================= COMPANY SECURITY =================
           if (
             !ticket.companyId ||
             ticket.companyId.toString() !== req.agent.companyId.toString()
@@ -3255,13 +3252,29 @@ async function run() {
             });
           }
 
-          // ================= ASSIGNED AGENT CHECK =================
-          // Only assigned agent can generate reply
+          // ================== ticket context ===============
+          const ticketContext = {
+            ticketNumber: ticket.ticketNumber || null,
+            status: ticket.status || null,
+            supportMode: ticket.supportMode || null,
+            resolutionSource: ticket.resolutionSource || null,
+            description: ticket.ticketData?.description || null,
+            aiAnalysis: {
+              ticketTitle: ticket.aiResult?.ticketTitle || null,
+              summary: ticket.aiResult?.summary || null,
+              category: ticket.aiResult?.category || null,
+              rootCause: ticket.aiResult?.rootCause || null,
+              metrics: ticket.aiResult?.metrics || [],
+              states: ticket.aiResult?.states || [],
+              recommendations: ticket.aiResult?.recommendations || [],
+              steps: ticket.aiResult?.steps || [],
+              escalation: ticket.aiResult?.escalation || null,
+            },
+          };
+          // ================= CURRENT ASSIGNED AGENT =================
+          const currentAgentUid = getCurrentAgentUid(ticket.agentHistory || []);
 
-          if (
-            ticket.assignedAgent?.uid &&
-            ticket.assignedAgent.uid !== req.agent.uid
-          ) {
+          if (currentAgentUid && currentAgentUid !== req.agent.uid) {
             return res.status(403).send({
               success: false,
               message: "This ticket is assigned to another agent",
@@ -3269,7 +3282,6 @@ async function run() {
           }
 
           // ================= CUSTOMER =================
-
           const customer = await users.findOne({
             uid: ticket.uid,
           });
@@ -3281,45 +3293,79 @@ async function run() {
             });
           }
 
-          // ================= AI RESULT =================
+          // ================= CUSTOMER COMPANY =================
 
-          const aiResult = ticket.aiResult;
+          let companyName = null;
 
-          if (!aiResult) {
-            return res.status(400).send({
-              success: false,
-              message: "AI analysis is not available for this ticket",
-            });
+          if (customer.companyId) {
+            try {
+              const company = await companies.findOne({
+                _id: new ObjectId(customer.companyId),
+              });
+
+              companyName = company?.companyName || null;
+            } catch {
+              companyName = null;
+            }
           }
 
-          // ================= CONVERSATION =================
-          const conversations = [];
+          const customerContext = {
+            uid: customer.uid || null,
+            displayName: customer.displayName || "Customer",
+            email: customer.email || null,
+            role: customer.role || "customer",
+            companyName: customer.companyName || null,
+          };
 
           // ================= AGENT =================
-          const agent = {
+          const agentContext = {
             uid: req.agent.uid,
-            displayName: req.agent.displayName,
+            displayName: req.agent.displayName || "Support Agent",
             email: req.agent.email,
             role: "agent",
           };
 
-          // ================= AI =================
+          // ================= GET CHAT HISTORY =================
+          const conversationHistory = await supportConversations
+            .find(
+              {
+                ticketId: new ObjectId(ticketId),
+              },
+              {
+                projection: {
+                  _id: 0,
+                  "sender.uid": 1,
+                  "sender.role": 1,
+                  "sender.displayName": 1,
+                  message: 1,
+                  createdAt: 1,
+                },
+              },
+            )
+            .sort({
+              createdAt: -1,
+            })
+            .limit(15)
+            .toArray();
 
+          conversationHistory.reverse();
+
+          // ================= AI =================
           const result = await suggestAgentReply({
-            ticket,
-            customer,
-            aiResult,
-            conversations,
-            agent,
+            ticketContext,
+            customerContext,
+            agentContext,
+            conversationHistory,
+            agentDraft: typeof agentDraft === "string" ? agentDraft.trim() : "",
           });
 
           // ================= RESPONSE =================
-
           return res.send({
             success: true,
             data: {
               reply: result.reply,
             },
+
             meta: result.meta,
           });
         } catch (error) {
