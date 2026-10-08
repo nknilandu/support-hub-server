@@ -28,18 +28,6 @@ const generateTicketNumber = () => {
   const randomPart = crypto.randomBytes(2).toString("hex").toUpperCase();
   return `TCK-${timePart}${randomPart}`;
 };
-//============== get agent function ====================
-const getCurrentAgentUid = (agentHistory = []) => {
-  if (!agentHistory.length) return null;
-
-  const latest = agentHistory.reduce((latest, current) => {
-    if (!latest) return current;
-
-    return new Date(current.date) > new Date(latest.date) ? current : latest;
-  }, null);
-
-  return latest?.action === "assigned" ? latest.uid : null;
-};
 
 //=============  verifyFirebaseToken =================
 // ===================================================
@@ -157,7 +145,6 @@ async function run() {
       ticketId = null,
       ticketNumber = null,
       path = "/",
-      readAt,
     }) => {
       await notifications.insertOne({
         uid,
@@ -417,19 +404,19 @@ async function run() {
     // ---------------------------------------------- CREATE TICKET -------------------------------------------------
     app.post("/tickets", verifyFirebaseToken, async (req, res) => {
       try {
-        const {
-          ticketData,
-          aiResult,
-          supportMode,
-          resolutionSource,
-          aiResolved,
-          escalatedToHuman,
-        } = req.body;
+        const { ticketData, aiResult, resolutionType } = req.body;
 
-        if (!ticketData || !aiResult || !supportMode) {
+        if (!ticketData || !aiResult || !resolutionType) {
           return res.status(400).send({
             success: false,
             message: "Required fields missing",
+          });
+        }
+
+        if (!["ai", "human"].includes(resolutionType)) {
+          return res.status(400).send({
+            success: false,
+            message: "Invalid resolution type",
           });
         }
 
@@ -461,21 +448,46 @@ async function run() {
         const now = new Date();
         const ticketNumber = generateTicketNumber();
 
+        const isAiResolved = resolutionType === "ai";
+
         const ticket = {
-          supportMode,
-          resolutionSource,
-          aiResolved,
-          escalatedToHuman,
+          supportMode: isAiResolved ? "ai" : "human",
+          resolutionSource: isAiResolved ? "ai" : null,
+          aiResolved: isAiResolved,
+          escalatedToHuman: !isAiResolved,
+
           ticketData,
           aiResult,
+
           uid: user.uid,
-          email: user.email || null,
           ticketNumber,
           companyId: new ObjectId(user.companyId),
-          status: "open",
+
+          status: isAiResolved ? "resolved" : "open",
+
           currentAgent: null,
           resolvedBy: null,
-          agentHistory: [],
+          resolvedAt: isAiResolved ? now : null,
+
+          actionHistory: [
+            {
+              uid: user.uid,
+              role: "customer",
+              action: "created",
+              date: now,
+            },
+            ...(isAiResolved
+              ? [
+                  {
+                    uid: user.uid,
+                    role: "customer",
+                    action: "ai_resolved",
+                    date: now,
+                  },
+                ]
+              : []),
+          ],
+
           createdAt: now,
           updatedAt: now,
         };
@@ -486,9 +498,13 @@ async function run() {
           await createNotification({
             uid: user.uid,
             userEmail: user.email,
-            title: "Ticket Created Successfully",
-            message: `Your ticket ${ticketNumber} has been created. Our team will review it shortly.`,
-            type: "ticket_created",
+            title: isAiResolved
+              ? "Ticket Resolved by AI"
+              : "Ticket Created Successfully",
+            message: isAiResolved
+              ? `Your ticket ${ticketNumber} has been resolved by AI.`
+              : `Your ticket ${ticketNumber} has been created. Our team will review it shortly.`,
+            type: isAiResolved ? "ticket_resolved" : "ticket_created",
             ticketId: result.insertedId,
             ticketNumber,
             path: "/customer/my-tickets",
@@ -502,7 +518,9 @@ async function run() {
 
         return res.status(201).send({
           success: true,
-          message: "Ticket created successfully",
+          message: isAiResolved
+            ? "Ticket resolved by AI"
+            : "Ticket created successfully",
           id: result.insertedId,
           ticketNumber,
         });
@@ -564,6 +582,12 @@ async function run() {
                 $options: "i",
               },
             },
+            {
+              "aiResult.summary": {
+                $regex: search,
+                $options: "i",
+              },
+            },
           ];
         }
 
@@ -595,24 +619,13 @@ async function run() {
         const pageNumber = Math.max(Number(page) || 1, 1);
         const limitNumber = Math.min(Math.max(Number(limit) || 10, 1), 100);
         const skip = (pageNumber - 1) * limitNumber;
+
         const total = await tickets.countDocuments(queryData);
 
         const result = await tickets
           .aggregate([
             {
               $match: queryData,
-            },
-            {
-              $sort: {
-                updatedAt: -1,
-                createdAt: -1,
-              },
-            },
-            {
-              $skip: skip,
-            },
-            {
-              $limit: limitNumber,
             },
             {
               $lookup: {
@@ -631,21 +644,39 @@ async function run() {
               },
             },
             {
+              $sort: {
+                updatedAt: -1,
+                createdAt: -1,
+              },
+            },
+            {
+              $skip: skip,
+            },
+            {
+              $limit: limitNumber,
+            },
+            {
               $project: {
                 _id: 1,
                 uid: 1,
                 companyId: 1,
                 ticketNumber: 1,
+
                 status: 1,
                 supportMode: 1,
                 aiResolved: 1,
+                escalatedToHuman: 1,
                 resolutionSource: 1,
+
                 createdAt: 1,
                 updatedAt: 1,
                 resolvedAt: 1,
+                reopenedAt: 1,
+                closedAt: 1,
+
                 currentAgent: 1,
                 resolvedBy: 1,
-                agentHistory: 1,
+                actionHistory: 1,
 
                 "aiResult.category": 1,
                 "aiResult.states": 1,
@@ -662,6 +693,7 @@ async function run() {
                     in: {
                       uid: "$$agent.uid",
                       displayName: "$$agent.displayName",
+                      name: "$$agent.name",
                       email: "$$agent.email",
                       photoURL: "$$agent.photoURL",
                       role: "$$agent.role",
@@ -680,6 +712,7 @@ async function run() {
                     in: {
                       uid: "$$agent.uid",
                       displayName: "$$agent.displayName",
+                      name: "$$agent.name",
                       email: "$$agent.email",
                       photoURL: "$$agent.photoURL",
                       role: "$$agent.role",
@@ -692,9 +725,77 @@ async function run() {
           ])
           .toArray();
 
+        const finalResult = result.map((ticket) => {
+          const canReadMessages =
+            ticket.aiResolved !== true &&
+            ["assigned", "in_progress", "resolved", "closed"].includes(
+              ticket.status,
+            );
+
+          const canSendMessage =
+            ticket.aiResolved !== true &&
+            ["assigned", "in_progress"].includes(ticket.status);
+
+          const canClose = ticket.status === "resolved";
+
+          const canReopen = ticket.status === "resolved";
+
+          const canDelete =
+            ticket.status === "open" &&
+            ticket.aiResolved !== true &&
+            !ticket.currentAgent?.uid &&
+            !ticket.resolvedBy?.uid &&
+            !ticket.actionHistory?.some(
+              (item) =>
+                item.role === "agent" ||
+                ["ai_resolved", "reopened", "closed"].includes(item.action),
+            );
+
+          return {
+            ...ticket,
+
+            currentAgentInfo: ticket.currentAgentInfo?.uid
+              ? {
+                  uid: ticket.currentAgentInfo.uid,
+                  displayName:
+                    ticket.currentAgentInfo.displayName ||
+                    ticket.currentAgentInfo.name ||
+                    null,
+                  email: ticket.currentAgentInfo.email || null,
+                  photoURL: ticket.currentAgentInfo.photoURL || null,
+                  role: ticket.currentAgentInfo.role || "agent",
+                  status: ticket.currentAgentInfo.status || null,
+                }
+              : null,
+
+            resolvedByInfo: ticket.resolvedByInfo?.uid
+              ? {
+                  uid: ticket.resolvedByInfo.uid,
+                  displayName:
+                    ticket.resolvedByInfo.displayName ||
+                    ticket.resolvedByInfo.name ||
+                    null,
+                  email: ticket.resolvedByInfo.email || null,
+                  photoURL: ticket.resolvedByInfo.photoURL || null,
+                  role: ticket.resolvedByInfo.role || "agent",
+                  status: ticket.resolvedByInfo.status || null,
+                }
+              : null,
+
+            permission: {
+              canRead: true,
+              canReadMessages,
+              canSendMessage,
+              canClose,
+              canReopen,
+              canDelete,
+            },
+          };
+        });
+
         return res.send({
           success: true,
-          data: result,
+          data: finalResult,
           pagination: {
             total,
             page: pageNumber,
@@ -747,6 +848,7 @@ async function run() {
           };
 
           const totalTickets = await tickets.countDocuments(ticketQuery);
+
           const openTickets = await tickets.countDocuments({
             ...ticketQuery,
             status: "open",
@@ -774,7 +876,7 @@ async function run() {
 
           const aiResolved = await tickets.countDocuments({
             ...ticketQuery,
-            resolutionSource: "ai",
+            aiResolved: true,
           });
 
           const statusAggregation = await tickets
@@ -804,7 +906,7 @@ async function run() {
           };
 
           statusAggregation.forEach((item) => {
-            if (item._id in statusChart) {
+            if (item._id && item._id in statusChart) {
               statusChart[item._id] = item.count;
             }
           });
@@ -873,15 +975,19 @@ async function run() {
             .find(ticketQuery)
             .sort({
               updatedAt: -1,
+              createdAt: -1,
             })
             .limit(5)
             .project({
               _id: 1,
               ticketNumber: 1,
               status: 1,
+              supportMode: 1,
+              aiResolved: 1,
+              escalatedToHuman: 1,
+              resolutionSource: 1,
               updatedAt: 1,
               createdAt: 1,
-              resolutionSource: 1,
               "aiResult.ticketTitle": 1,
               "aiResult.states": 1,
               "aiResult.summary": 1,
@@ -889,13 +995,16 @@ async function run() {
             })
             .toArray();
 
+          const resolvedOrClosedTickets = resolvedTickets + closedTickets;
+
           const resolutionRate =
             totalTickets > 0
-              ? Math.round((resolvedTickets / totalTickets) * 100)
+              ? Math.round((resolvedOrClosedTickets / totalTickets) * 100)
               : 0;
 
           return res.send({
             success: true,
+
             metrics: {
               totalTickets,
               openTickets,
@@ -905,9 +1014,11 @@ async function run() {
               closedTickets,
               aiResolved,
             },
+
             statusChart,
             activityChart,
             recentTickets,
+
             insights: {
               resolutionRate,
               aiResolved,
@@ -924,12 +1035,10 @@ async function run() {
       },
     );
 
-    // ------------------------------------------- GET SINGLE TICKET ------------------------------------------------
+    //-------------------------------------------- GET SINGLE TICKET -----------------------------------------------
     app.get("/tickets/:ticketId", verifyFirebaseToken, async (req, res) => {
       try {
         const { ticketId } = req.params;
-
-        // ================= VALIDATE TICKET ID =================
 
         if (!ObjectId.isValid(ticketId)) {
           return res.status(400).send({
@@ -937,8 +1046,6 @@ async function run() {
             message: "Invalid ticket ID",
           });
         }
-
-        // ================= CURRENT USER =================
 
         const currentUser = await users.findOne({
           uid: req.user.uid,
@@ -951,8 +1058,6 @@ async function run() {
           });
         }
 
-        // ================= GET TICKET =================
-
         const ticket = await tickets.findOne({
           _id: new ObjectId(ticketId),
         });
@@ -964,62 +1069,52 @@ async function run() {
           });
         }
 
-        // ================= USER TYPE =================
-
         const isOwnerOrAdmin = ["owner", "admin"].includes(currentUser.role);
-
         const isCustomer = currentUser.role === "customer";
-
         const isAgent = currentUser.role === "agent";
 
-        // ================= CUSTOMER =================
-
         const isTicketOwner = isCustomer && ticket.uid === currentUser.uid;
-
-        // ================= COMPANY =================
 
         const sameCompany =
           currentUser.companyId &&
           ticket.companyId &&
           String(currentUser.companyId) === String(ticket.companyId);
 
-        // ================= CURRENT AGENT =================
-
         const isCurrentAgent =
           isAgent && ticket.currentAgent?.uid === currentUser.uid;
 
-        // =====================================================
-        // TICKET READ PERMISSION
-        // =====================================================
+        const customerChatReadStatuses = [
+          "assigned",
+          "in_progress",
+          "resolved",
+          "closed",
+        ];
+
+        const agentChatReadStatuses = [
+          "assigned",
+          "in_progress",
+          "resolved",
+          "closed",
+        ];
 
         let canRead = false;
 
-        // Owner / Admin
         if (isOwnerOrAdmin) {
           canRead = true;
-        }
-
-        // Customer can read own ticket
-        else if (isTicketOwner) {
+        } else if (isTicketOwner) {
           canRead = true;
-        }
-
-        // Agent
-        else if (isAgent && sameCompany) {
-          // Open + unassigned ticket
-          // Everyone in the company agent queue can view
-          if (ticket.status === "open" && !ticket.currentAgent?.uid) {
+        } else if (isAgent && sameCompany) {
+          if (ticket.aiResolved === true) {
             canRead = true;
-          }
-
-          // Assigned / In Progress / Resolved
-          // Only current agent can view
-          else if (isCurrentAgent) {
+          } else if (ticket.status === "open" && !ticket.currentAgent?.uid) {
+            canRead = true;
+          } else if (
+            isCurrentAgent &&
+            agentChatReadStatuses.includes(ticket.status)
+          ) {
             canRead = true;
           }
         }
-
-        // ================= DENY TICKET ACCESS =================
 
         if (!canRead) {
           return res.status(403).send({
@@ -1028,67 +1123,63 @@ async function run() {
           });
         }
 
-        // =====================================================
-        // MESSAGE READ PERMISSION
-        // =====================================================
-
         let canReadMessages = false;
 
-        // Owner / Admin
         if (isOwnerOrAdmin) {
           canReadMessages = true;
-        }
-
-        // Ticket owner
-        else if (isTicketOwner) {
+        } else if (
+          isTicketOwner &&
+          ticket.aiResolved !== true &&
+          customerChatReadStatuses.includes(ticket.status)
+        ) {
+          canReadMessages = true;
+        } else if (
+          isAgent &&
+          sameCompany &&
+          isCurrentAgent &&
+          ticket.aiResolved !== true &&
+          agentChatReadStatuses.includes(ticket.status)
+        ) {
           canReadMessages = true;
         }
 
-        // Current agent only
-        else if (isAgent && sameCompany) {
-          if (isCurrentAgent) {
-            canReadMessages = true;
-          }
-        }
+        const canCustomerSendMessage =
+          isTicketOwner &&
+          ticket.aiResolved !== true &&
+          ["assigned", "in_progress"].includes(ticket.status);
 
-        // =====================================================
-        // ASSIGN PERMISSION
-        // =====================================================
+        const canAgentSendMessage =
+          isCurrentAgent &&
+          ticket.aiResolved !== true &&
+          ["assigned", "in_progress"].includes(ticket.status);
+
+        const canSendMessage = canCustomerSendMessage || canAgentSendMessage;
 
         const canAssign =
           isAgent &&
           sameCompany &&
+          ticket.aiResolved !== true &&
           ticket.status === "open" &&
           !ticket.currentAgent?.uid;
 
-        // =====================================================
-        // SEND MESSAGE PERMISSION
-        // =====================================================
-
-        const canCustomerSendMessage =
-          isTicketOwner && ["assigned", "in_progress"].includes(ticket.status);
-
-        const canAgentSendMessage =
-          isCurrentAgent && ["assigned", "in_progress"].includes(ticket.status);
-
-        const canSendMessage = canCustomerSendMessage || canAgentSendMessage;
-
-        // =====================================================
-        // AGENT ACTION PERMISSIONS
-        // =====================================================
-
         const canSuggestReply =
-          isCurrentAgent && ["assigned", "in_progress"].includes(ticket.status);
+          isCurrentAgent &&
+          ticket.aiResolved !== true &&
+          ["assigned", "in_progress"].includes(ticket.status);
 
         const canRelease =
-          isCurrentAgent && ["assigned", "in_progress"].includes(ticket.status);
+          isCurrentAgent &&
+          ticket.aiResolved !== true &&
+          ["assigned", "in_progress"].includes(ticket.status);
 
         const canResolve =
-          isCurrentAgent && ["assigned", "in_progress"].includes(ticket.status);
+          isCurrentAgent &&
+          ticket.aiResolved !== true &&
+          ["assigned", "in_progress"].includes(ticket.status);
 
-        // =====================================================
-        // CUSTOMER INFO
-        // =====================================================
+        const canClose = isTicketOwner && ticket.status === "resolved";
+
+        const canReopen = isTicketOwner && ticket.status === "resolved";
 
         let customerInfo = null;
 
@@ -1102,6 +1193,7 @@ async function run() {
                 _id: 0,
                 uid: 1,
                 displayName: 1,
+                name: 1,
                 email: 1,
                 photoURL: 1,
                 role: 1,
@@ -1115,33 +1207,37 @@ async function run() {
             let companyName = null;
 
             if (customer.companyId) {
-              let customerCompanyId = customer.companyId;
+              try {
+                let customerCompanyId = customer.companyId;
 
-              if (
-                typeof customerCompanyId === "string" &&
-                ObjectId.isValid(customerCompanyId)
-              ) {
-                customerCompanyId = new ObjectId(customerCompanyId);
-              }
+                if (
+                  typeof customerCompanyId === "string" &&
+                  ObjectId.isValid(customerCompanyId)
+                ) {
+                  customerCompanyId = new ObjectId(customerCompanyId);
+                }
 
-              const company = await companies.findOne(
-                {
-                  _id: customerCompanyId,
-                },
-                {
-                  projection: {
-                    _id: 0,
-                    name: 1,
+                const company = await companies.findOne(
+                  {
+                    _id: customerCompanyId,
                   },
-                },
-              );
+                  {
+                    projection: {
+                      _id: 0,
+                      companyName: 1,
+                    },
+                  },
+                );
 
-              companyName = company?.name || null;
+                companyName = company?.companyName || null;
+              } catch {
+                companyName = null;
+              }
             }
 
             customerInfo = {
-              uid: customer.uid,
-              displayName: customer.displayName || null,
+              uid: customer.uid || null,
+              displayName: customer.displayName || customer.name || null,
               email: customer.email || null,
               photoURL: customer.photoURL || null,
               role: customer.role || "customer",
@@ -1150,10 +1246,6 @@ async function run() {
             };
           }
         }
-
-        // =====================================================
-        // CURRENT AGENT INFO
-        // =====================================================
 
         let agentInfo = null;
 
@@ -1167,6 +1259,7 @@ async function run() {
                 _id: 0,
                 uid: 1,
                 displayName: 1,
+                name: 1,
                 email: 1,
                 photoURL: 1,
                 role: 1,
@@ -1178,7 +1271,7 @@ async function run() {
           if (agent) {
             agentInfo = {
               uid: agent.uid,
-              displayName: agent.displayName || null,
+              displayName: agent.displayName || agent.name || "Agent",
               email: agent.email || null,
               photoURL: agent.photoURL || null,
               role: agent.role || "agent",
@@ -1187,10 +1280,6 @@ async function run() {
             };
           }
         }
-
-        // =====================================================
-        // RESOLVED BY INFO
-        // =====================================================
 
         let resolvedByInfo = null;
 
@@ -1204,6 +1293,7 @@ async function run() {
                 _id: 0,
                 uid: 1,
                 displayName: 1,
+                name: 1,
                 email: 1,
                 photoURL: 1,
                 role: 1,
@@ -1215,7 +1305,8 @@ async function run() {
           if (resolvedAgent) {
             resolvedByInfo = {
               uid: resolvedAgent.uid,
-              displayName: resolvedAgent.displayName || null,
+              displayName:
+                resolvedAgent.displayName || resolvedAgent.name || "Agent",
               email: resolvedAgent.email || null,
               photoURL: resolvedAgent.photoURL || null,
               role: resolvedAgent.role || "agent",
@@ -1225,19 +1316,13 @@ async function run() {
           }
         }
 
-        // =====================================================
-        // RESPONSE
-        // =====================================================
-
         return res.send({
           success: true,
-
           data: {
             ...ticket,
             customerInfo,
             agentInfo,
             resolvedByInfo,
-
             permission: {
               canRead,
               canReadMessages,
@@ -1246,6 +1331,8 @@ async function run() {
               canRelease,
               canResolve,
               canAssign,
+              canClose,
+              canReopen,
               isCurrentAgent,
             },
           },
@@ -1294,11 +1381,11 @@ async function run() {
           });
         }
 
-        const isOwnerOrAdmin = ["owner", "admin"].includes(currentUser.role);
+        const ticketObjectId = new ObjectId(ticketId);
 
-        if (isOwnerOrAdmin) {
+        if (["owner", "admin"].includes(currentUser.role)) {
           const result = await tickets.deleteOne({
-            _id: new ObjectId(ticketId),
+            _id: ticketObjectId,
           });
 
           if (result.deletedCount === 0) {
@@ -1324,10 +1411,18 @@ async function run() {
           });
         }
 
+        const hasSupportHistory = ticket.actionHistory?.some(
+          (item) =>
+            item.role === "agent" ||
+            ["ai_resolved", "reopened", "closed"].includes(item.action),
+        );
+
         if (
+          ticket.status !== "open" ||
           ticket.currentAgent?.uid ||
           ticket.resolvedBy?.uid ||
-          ticket.agentHistory?.length > 0
+          ticket.aiResolved === true ||
+          hasSupportHistory
         ) {
           return res.status(400).send({
             success: false,
@@ -1337,8 +1432,11 @@ async function run() {
         }
 
         const result = await tickets.deleteOne({
-          _id: new ObjectId(ticketId),
+          _id: ticketObjectId,
           uid: currentUser.uid,
+          status: "open",
+          currentAgent: null,
+          aiResolved: false,
         });
 
         if (result.deletedCount === 0) {
@@ -1351,7 +1449,6 @@ async function run() {
         try {
           await createNotification({
             uid: ticket.uid,
-            userEmail: currentUser.email || ticket.email,
             title: "Ticket Deleted",
             message: `Your ticket ${ticket.ticketNumber} has been deleted.`,
             type: "ticket_deleted",
@@ -1375,6 +1472,230 @@ async function run() {
         });
       }
     });
+
+    // ---------------------------------------- Update TICKET TO CLOSED ---------------------------------------------
+    app.patch(
+      "/tickets/:ticketId/close",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const { ticketId } = req.params;
+
+          if (!ObjectId.isValid(ticketId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Invalid ticket ID",
+            });
+          }
+
+          const currentUser = await users.findOne({
+            uid: req.user.uid,
+          });
+
+          if (!currentUser) {
+            return res.status(404).send({
+              success: false,
+              message: "User not found",
+            });
+          }
+
+          if (currentUser.role !== "customer") {
+            return res.status(403).send({
+              success: false,
+              message: "Only the customer can close this ticket",
+            });
+          }
+
+          const ticketObjectId = new ObjectId(ticketId);
+
+          const ticket = await tickets.findOne({
+            _id: ticketObjectId,
+          });
+
+          if (!ticket) {
+            return res.status(404).send({
+              success: false,
+              message: "Ticket not found",
+            });
+          }
+
+          if (ticket.uid !== currentUser.uid) {
+            return res.status(403).send({
+              success: false,
+              message: "You are not allowed to close this ticket",
+            });
+          }
+
+          if (ticket.status !== "resolved") {
+            return res.status(409).send({
+              success: false,
+              message: "Only resolved tickets can be closed",
+            });
+          }
+
+          const now = new Date();
+
+          const result = await tickets.updateOne(
+            {
+              _id: ticketObjectId,
+              uid: currentUser.uid,
+              status: "resolved",
+            },
+            {
+              $set: {
+                status: "closed",
+                updatedAt: now,
+                closedAt: now,
+                closedBy: {
+                  uid: currentUser.uid,
+                  updatedAt: now,
+                },
+              },
+              $push: {
+                actionHistory: {
+                  uid: currentUser.uid,
+                  role: "customer",
+                  action: "closed",
+                  date: now,
+                },
+              },
+            },
+          );
+
+          if (result.modifiedCount === 0) {
+            return res.status(409).send({
+              success: false,
+              message: "Ticket status changed. Please refresh and try again.",
+            });
+          }
+
+          return res.send({
+            success: true,
+            message: "Ticket closed successfully",
+          });
+        } catch (error) {
+          console.error("CLOSE TICKET ERROR:", error);
+
+          return res.status(500).send({
+            success: false,
+            message: "Failed to close ticket",
+          });
+        }
+      },
+    );
+
+    // ---------------------------------------- UPDATE TICKET TO REOPEN ---------------------------------------------
+    app.patch(
+      "/tickets/:ticketId/reopen",
+      verifyFirebaseToken,
+      async (req, res) => {
+        try {
+          const { ticketId } = req.params;
+
+          if (!ObjectId.isValid(ticketId)) {
+            return res.status(400).send({
+              success: false,
+              message: "Invalid ticket ID",
+            });
+          }
+
+          const currentUser = await users.findOne({
+            uid: req.user.uid,
+          });
+
+          if (!currentUser) {
+            return res.status(404).send({
+              success: false,
+              message: "User not found",
+            });
+          }
+
+          if (currentUser.role !== "customer") {
+            return res.status(403).send({
+              success: false,
+              message: "Only the customer can reopen this ticket",
+            });
+          }
+
+          const ticketObjectId = new ObjectId(ticketId);
+
+          const ticket = await tickets.findOne({
+            _id: ticketObjectId,
+          });
+
+          if (!ticket) {
+            return res.status(404).send({
+              success: false,
+              message: "Ticket not found",
+            });
+          }
+
+          if (ticket.uid !== currentUser.uid) {
+            return res.status(403).send({
+              success: false,
+              message: "You are not allowed to reopen this ticket",
+            });
+          }
+
+          if (ticket.status !== "resolved") {
+            return res.status(409).send({
+              success: false,
+              message: "Only resolved tickets can be reopened",
+            });
+          }
+
+          const now = new Date();
+
+          const result = await tickets.updateOne(
+            {
+              _id: ticketObjectId,
+              uid: currentUser.uid,
+              status: "resolved",
+            },
+            {
+              $set: {
+                status: "open",
+                supportMode: "human",
+                resolutionSource: null,
+                aiResolved: false,
+                escalatedToHuman: true,
+                currentAgent: null,
+                resolvedAt: null,
+                updatedAt: now,
+                reopenedAt: now,
+              },
+              $push: {
+                actionHistory: {
+                  uid: currentUser.uid,
+                  role: "customer",
+                  action: "reopened",
+                  date: now,
+                },
+              },
+            },
+          );
+
+          if (result.modifiedCount === 0) {
+            return res.status(409).send({
+              success: false,
+              message: "Ticket status changed. Please refresh and try again.",
+            });
+          }
+
+          return res.send({
+            success: true,
+            message: "Ticket reopened successfully",
+          });
+        } catch (error) {
+          console.error("REOPEN TICKET ERROR:", error);
+
+          return res.status(500).send({
+            success: false,
+            message: "Failed to reopen ticket",
+          });
+        }
+      },
+    );
 
     // ==============================================================================================================
     // =============================================== AGENT RELATED ================================================
@@ -1400,6 +1721,7 @@ async function run() {
           const agentTicketFilter = {
             companyId,
             "currentAgent.uid": agentUid,
+            aiResolved: false,
             status: {
               $in: ["assigned", "in_progress", "resolved"],
             },
@@ -1428,6 +1750,7 @@ async function run() {
             tickets.countDocuments({
               companyId,
               status: "open",
+              aiResolved: false,
               ...unassignedCondition,
             }),
 
@@ -1544,6 +1867,7 @@ async function run() {
                 $match: {
                   companyId,
                   status: "open",
+                  aiResolved: false,
                   ...unassignedCondition,
                   "aiResult.states": {
                     $elemMatch: {
@@ -1874,8 +2198,8 @@ async function run() {
               ...pipeline,
               {
                 $sort: {
-                  updatedAt: -1,
                   createdAt: -1,
+                  _id: -1,
                 },
               },
               {
@@ -2014,6 +2338,7 @@ async function run() {
           const match = {
             companyId,
             "currentAgent.uid": req.agent.uid,
+            aiResolved: false,
             status: {
               $in: ["assigned", "in_progress", "resolved"],
             },
@@ -2121,7 +2446,7 @@ async function run() {
               {
                 $sort: {
                   updatedAt: -1,
-                  createdAt: -1,
+                  _id: -1,
                 },
               },
               {
@@ -2234,19 +2559,28 @@ async function run() {
               companyId,
               status: "open",
               currentAgent: null,
+              aiResolved: false,
             },
             {
               $set: {
                 status: "assigned",
+                supportMode: "human",
+                resolutionSource: null,
+                aiResolved: false,
+                escalatedToHuman: true,
+
                 currentAgent: {
                   uid: req.agent.uid,
                   updatedAt: assignedAt,
                 },
+
                 updatedAt: assignedAt,
               },
+
               $push: {
-                agentHistory: {
+                actionHistory: {
                   uid: req.agent.uid,
+                  role: "agent",
                   action: "assigned",
                   date: assignedAt,
                 },
@@ -2267,6 +2601,27 @@ async function run() {
               });
             }
 
+            if (ticket.aiResolved === true) {
+              return res.status(409).send({
+                success: false,
+                message: "AI-resolved tickets cannot be assigned",
+              });
+            }
+
+            if (ticket.status !== "open") {
+              return res.status(409).send({
+                success: false,
+                message: "This ticket is not open",
+              });
+            }
+
+            if (ticket.currentAgent?.uid) {
+              return res.status(409).send({
+                success: false,
+                message: "This ticket is already assigned to another agent",
+              });
+            }
+
             return res.status(409).send({
               success: false,
               message: "This ticket is not available for assignment",
@@ -2278,10 +2633,16 @@ async function run() {
             companyId,
           });
 
+          if (!updatedTicket) {
+            return res.status(404).send({
+              success: false,
+              message: "Ticket not found after assignment",
+            });
+          }
+
           try {
             await createNotification({
               uid: updatedTicket.uid,
-              userEmail: updatedTicket.email,
               title: "Ticket Assigned to Support Agent",
               message: `Your ticket ${updatedTicket.ticketNumber} has been assigned to a support agent.`,
               type: "ticket_assigned",
@@ -2292,7 +2653,6 @@ async function run() {
 
             await createNotification({
               uid: req.agent.uid,
-              userEmail: req.agent.email,
               title: "Ticket Assigned to You",
               message: `Ticket ${updatedTicket.ticketNumber} has been assigned to you.`,
               type: "ticket_assigned",
@@ -2388,12 +2748,17 @@ async function run() {
             {
               $set: {
                 status: "open",
+                supportMode: "human",
+                resolutionSource: null,
+                aiResolved: false,
+                escalatedToHuman: true,
                 currentAgent: null,
                 updatedAt: releasedAt,
               },
               $push: {
-                agentHistory: {
+                actionHistory: {
                   uid: req.agent.uid,
+                  role: "agent",
                   action: "released",
                   date: releasedAt,
                 },
@@ -2417,7 +2782,6 @@ async function run() {
           try {
             await createNotification({
               uid: updatedTicket.uid,
-              userEmail: updatedTicket.email,
               title: "Ticket Returned to Support Queue",
               message: `Your ticket ${updatedTicket.ticketNumber} has been returned to the support queue.`,
               type: "ticket_released",
@@ -2428,7 +2792,6 @@ async function run() {
 
             await createNotification({
               uid: req.agent.uid,
-              userEmail: req.agent.email,
               title: "Ticket Returned to Queue",
               message: `You returned ticket ${updatedTicket.ticketNumber} to the company queue.`,
               type: "ticket_returned",
@@ -2512,6 +2875,13 @@ async function run() {
             });
           }
 
+          if (ticket.aiResolved === true) {
+            return res.status(409).send({
+              success: false,
+              message: "AI-resolved ticket cannot be resolved by an agent",
+            });
+          }
+
           const result = await tickets.updateOne(
             {
               _id: ticketId,
@@ -2520,11 +2890,15 @@ async function run() {
                 $in: ["assigned", "in_progress"],
               },
               "currentAgent.uid": req.agent.uid,
+              aiResolved: false,
             },
             {
               $set: {
                 status: "resolved",
+                supportMode: "human",
                 resolutionSource: "agent",
+                aiResolved: false,
+                escalatedToHuman: true,
                 resolvedAt,
                 updatedAt: resolvedAt,
 
@@ -2539,8 +2913,9 @@ async function run() {
                 },
               },
               $push: {
-                agentHistory: {
+                actionHistory: {
                   uid: req.agent.uid,
+                  role: "agent",
                   action: "resolved",
                   date: resolvedAt,
                 },
@@ -2564,7 +2939,6 @@ async function run() {
           try {
             await createNotification({
               uid: updatedTicket.uid,
-              userEmail: updatedTicket.email,
               title: "Ticket Resolved",
               message: `Your ticket ${updatedTicket.ticketNumber} has been resolved by our support team.`,
               type: "ticket_resolved",
@@ -2575,7 +2949,6 @@ async function run() {
 
             await createNotification({
               uid: req.agent.uid,
-              userEmail: req.agent.email,
               title: "Ticket Resolved",
               message: `You resolved ticket ${updatedTicket.ticketNumber}.`,
               type: "ticket_resolved",
@@ -2643,51 +3016,43 @@ async function run() {
             });
           }
 
-          // ================= USER TYPE =================
-
           const isOwnerOrAdmin = ["owner", "admin"].includes(currentUser.role);
 
           const isCustomer = currentUser.role === "customer";
-
           const isAgent = currentUser.role === "agent";
 
-          // ================= CUSTOMER =================
-
           const isTicketOwner = isCustomer && ticket.uid === currentUser.uid;
-
-          // ================= COMPANY =================
 
           const sameCompany =
             currentUser.companyId &&
             ticket.companyId &&
             String(currentUser.companyId) === String(ticket.companyId);
 
-          // ================= CURRENT AGENT =================
-
           const isCurrentAgent =
             isAgent && ticket.currentAgent?.uid === currentUser.uid;
 
-          // ================= MESSAGE READ =================
-
           let canReadMessages = false;
 
-          // Owner/Admin
           if (isOwnerOrAdmin) {
             canReadMessages = true;
-          }
-
-          // Ticket customer
-          else if (isTicketOwner) {
+          } else if (
+            isTicketOwner &&
+            ticket.aiResolved !== true &&
+            ["assigned", "in_progress", "resolved", "closed"].includes(
+              ticket.status,
+            )
+          ) {
             canReadMessages = true;
-          }
-
-          // Agent
-          else if (isAgent && sameCompany) {
-            // Agent can read conversation ONLY
-            // when he is the current agent
-            if (isCurrentAgent) {
-              canReadMessages = true;
-            }
+          } else if (
+            isAgent &&
+            sameCompany &&
+            isCurrentAgent &&
+            ticket.aiResolved !== true &&
+            ["assigned", "in_progress", "resolved", "closed"].includes(
+              ticket.status,
+            )
+          ) {
+            canReadMessages = true;
           }
 
           if (!canReadMessages) {
@@ -2697,7 +3062,6 @@ async function run() {
             });
           }
 
-          // ================= GET CONVERSATIONS =================
           const conversations = await supportConversations
             .find({
               ticketId: ticket._id,
@@ -2756,7 +3120,7 @@ async function run() {
             });
           }
 
-          if (currentUser.role !== "customer" && currentUser.role !== "agent") {
+          if (!["customer", "agent"].includes(currentUser.role)) {
             return res.status(403).send({
               success: false,
               message: "You are not allowed to send messages",
@@ -2776,9 +3140,16 @@ async function run() {
             });
           }
 
+          if (ticket.aiResolved === true) {
+            return res.status(409).send({
+              success: false,
+              message:
+                "This ticket was resolved by AI and does not support chat",
+            });
+          }
+
           const now = new Date();
 
-          // ================= CUSTOMER =================
           if (currentUser.role === "customer") {
             if (ticket.uid !== currentUser.uid) {
               return res.status(403).send({
@@ -2802,6 +3173,7 @@ async function run() {
                 status: {
                   $in: ["assigned", "in_progress"],
                 },
+                aiResolved: false,
               },
               {
                 $set: {
@@ -2818,7 +3190,6 @@ async function run() {
             }
           }
 
-          // ================= AGENT =================
           if (currentUser.role === "agent") {
             if (
               !ticket.companyId ||
@@ -2852,6 +3223,7 @@ async function run() {
                   _id: ticketObjectId,
                   status: "assigned",
                   "currentAgent.uid": currentUser.uid,
+                  aiResolved: false,
                 },
                 {
                   $set: {
@@ -2859,8 +3231,9 @@ async function run() {
                     updatedAt: now,
                   },
                   $push: {
-                    agentHistory: {
+                    actionHistory: {
                       uid: currentUser.uid,
+                      role: "agent",
                       action: "in_progress",
                       date: now,
                     },
@@ -2881,6 +3254,7 @@ async function run() {
                   _id: ticketObjectId,
                   status: "in_progress",
                   "currentAgent.uid": currentUser.uid,
+                  aiResolved: false,
                 },
                 {
                   $set: {
@@ -2930,6 +3304,26 @@ async function run() {
               success: false,
               message: "Message could not be sent",
             });
+          }
+
+          if (currentUser.role === "agent") {
+            try {
+              await createNotification({
+                uid: ticket.uid,
+                userEmail: ticket.email,
+                title: "New Support Reply",
+                message: `You received a new reply on ticket ${ticket.ticketNumber}.`,
+                type: "agent_reply",
+                ticketId: ticket._id,
+                ticketNumber: ticket.ticketNumber,
+                path: `/customer/tickets/${ticket._id}`,
+              });
+            } catch (notificationError) {
+              console.error(
+                "Agent reply notification error:",
+                notificationError.message,
+              );
+            }
           }
 
           return res.status(201).send({
@@ -3396,8 +3790,6 @@ async function run() {
         try {
           const { ticketId, agentDraft = "" } = req.body;
 
-          // ================= VALIDATION =================
-
           if (!ticketId) {
             return res.status(400).send({
               success: false,
@@ -3412,8 +3804,6 @@ async function run() {
             });
           }
 
-          // ================= FIND TICKET =================
-
           const ticket = await tickets.findOne({
             _id: new ObjectId(ticketId),
           });
@@ -3425,7 +3815,6 @@ async function run() {
             });
           }
 
-          // ================= COMPANY SECURITY =================
           if (
             !ticket.companyId ||
             ticket.companyId.toString() !== req.agent.companyId.toString()
@@ -3436,7 +3825,27 @@ async function run() {
             });
           }
 
-          // ================== ticket context ===============
+          if (ticket.aiResolved === true) {
+            return res.status(409).send({
+              success: false,
+              message: "AI-resolved tickets do not support agent replies",
+            });
+          }
+
+          if (ticket.currentAgent?.uid !== req.agent.uid) {
+            return res.status(403).send({
+              success: false,
+              message: "This ticket is assigned to another agent",
+            });
+          }
+
+          if (!["assigned", "in_progress"].includes(ticket.status)) {
+            return res.status(409).send({
+              success: false,
+              message: "AI suggested reply is unavailable for this ticket",
+            });
+          }
+
           const ticketContext = {
             ticketNumber: ticket.ticketNumber || null,
             status: ticket.status || null,
@@ -3455,17 +3864,7 @@ async function run() {
               escalation: ticket.aiResult?.escalation || null,
             },
           };
-          // ================= CURRENT ASSIGNED AGENT =================
-          const currentAgentUid = getCurrentAgentUid(ticket.agentHistory || []);
 
-          if (currentAgentUid && currentAgentUid !== req.agent.uid) {
-            return res.status(403).send({
-              success: false,
-              message: "This ticket is assigned to another agent",
-            });
-          }
-
-          // ================= CUSTOMER =================
           const customer = await users.findOne({
             uid: ticket.uid,
           });
@@ -3477,20 +3876,14 @@ async function run() {
             });
           }
 
-          // ================= CUSTOMER COMPANY =================
-
           let companyName = null;
 
-          if (customer.companyId) {
-            try {
-              const company = await companies.findOne({
-                _id: new ObjectId(customer.companyId),
-              });
+          if (customer.companyId && ObjectId.isValid(customer.companyId)) {
+            const company = await companies.findOne({
+              _id: new ObjectId(customer.companyId),
+            });
 
-              companyName = company?.companyName || null;
-            } catch {
-              companyName = null;
-            }
+            companyName = company?.companyName || null;
           }
 
           const customerContext = {
@@ -3498,18 +3891,16 @@ async function run() {
             displayName: customer.displayName || "Customer",
             email: customer.email || null,
             role: customer.role || "customer",
-            companyName: customer.companyName || null,
+            companyName,
           };
 
-          // ================= AGENT =================
           const agentContext = {
             uid: req.agent.uid,
             displayName: req.agent.displayName || "Support Agent",
-            email: req.agent.email,
+            email: req.agent.email || null,
             role: "agent",
           };
 
-          // ================= GET CHAT HISTORY =================
           const conversationHistory = await supportConversations
             .find(
               {
@@ -3534,7 +3925,6 @@ async function run() {
 
           conversationHistory.reverse();
 
-          // ================= AI =================
           const result = await suggestAgentReply({
             ticketContext,
             customerContext,
@@ -3543,13 +3933,11 @@ async function run() {
             agentDraft: typeof agentDraft === "string" ? agentDraft.trim() : "",
           });
 
-          // ================= RESPONSE =================
           return res.send({
             success: true,
             data: {
               reply: result.reply,
             },
-
             meta: result.meta,
           });
         } catch (error) {
@@ -3562,6 +3950,7 @@ async function run() {
         }
       },
     );
+
     // ==================================================================================
     // ==================================================================================
     // ==================================================================================
@@ -3637,8 +4026,3 @@ run().catch(console.dir);
 app.listen(port, () => {
   console.log(`SupportHub server listening on port ${port}`);
 });
-
-
-
-
-
