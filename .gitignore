@@ -1,3 +1,4 @@
 node_modules
 .env
 support-hub-ai-firebase-admin-sdk.json
+.kilo
