@@ -677,9 +677,9 @@ module.exports = function createCommonRoutes({
     },
   );
 
-  // =====================================================
+// =====================================================
   // CONVERSATION ACCESS
-  // Approval is required here for agents.
+  // Supports 4 roles: customer, agent, manager (multiple), owner (multi-company)
   // =====================================================
 
   const checkConversationAccess = async ({
@@ -704,11 +704,8 @@ module.exports = function createCommonRoutes({
       });
     }
 
-    const role = user.role === "owner" ? "manager" : user.role;
-
-    const allowedRoles = write
-      ? ["customer", "agent"]
-      : ["customer", "agent", "manager"];
+    const role = user.role;
+    const allowedRoles = ["customer", "agent", "manager", "owner"];
 
     if (!allowedRoles.includes(role)) {
       throw Object.assign(
@@ -728,34 +725,99 @@ module.exports = function createCommonRoutes({
       );
     }
 
-    if (!user.companyId || !ObjectId.isValid(user.companyId)) {
-      throw Object.assign(new Error("Your company information is invalid"), {
-        status: 403,
-      });
-    }
+    const isLeadership = role === "manager" || role === "owner";
+    let companyId = null;
 
-    const companyId = new ObjectId(user.companyId);
+    if (role === "owner") {
+      // Owner can own multiple companies (via company.ownerUid / company.owners / user.companyIds / user.companyId)
+      const ticketDoc = await tickets.findOne(
+        { _id: ticketId },
+        { ...options, projection: { companyId: 1 } },
+      );
 
-    const company = await companies.findOne(
-      {
-        _id: companyId,
-        status: "active",
-      },
-      {
-        ...options,
-        projection: { _id: 1 },
-      },
-    );
+      if (!ticketDoc) {
+        throw Object.assign(new Error("Ticket not found"), {
+          status: 404,
+        });
+      }
 
-    if (!company) {
-      throw Object.assign(new Error("Your company is not active"), {
-        status: 403,
-      });
+      if (!ticketDoc.companyId || !ObjectId.isValid(ticketDoc.companyId)) {
+        throw Object.assign(new Error("Ticket company information is invalid"), {
+          status: 403,
+        });
+      }
+
+      const targetCompanyId = new ObjectId(ticketDoc.companyId);
+
+      const ownedCompanyIds = Array.isArray(user.companyIds)
+        ? user.companyIds
+            .filter((id) => ObjectId.isValid(id))
+            .map((id) => new ObjectId(id))
+        : [];
+
+      if (user.companyId && ObjectId.isValid(user.companyId)) {
+        ownedCompanyIds.push(new ObjectId(user.companyId));
+      }
+
+      const company = await companies.findOne(
+        {
+          _id: targetCompanyId,
+          status: "active",
+          $or: [
+            { ownerUid: user.uid },
+            { ownerId: user.uid },
+            { uid: user.uid },
+            { owners: user.uid },
+            ...(ownedCompanyIds.length > 0
+              ? [{ _id: { $in: ownedCompanyIds } }]
+              : []),
+          ],
+        },
+        {
+          ...options,
+          projection: { _id: 1 },
+        },
+      );
+
+      if (!company) {
+        throw Object.assign(
+          new Error("You do not have access to this company's ticket"),
+          { status: 403 },
+        );
+      }
+
+      companyId = company._id;
+    } else {
+      // customer, agent, and manager belong to their assigned companyId
+      if (!user.companyId || !ObjectId.isValid(user.companyId)) {
+        throw Object.assign(new Error("Your company information is invalid"), {
+          status: 403,
+        });
+      }
+
+      companyId = new ObjectId(user.companyId);
+
+      const company = await companies.findOne(
+        {
+          _id: companyId,
+          status: "active",
+        },
+        {
+          ...options,
+          projection: { _id: 1 },
+        },
+      );
+
+      if (!company) {
+        throw Object.assign(new Error("Your company is not active"), {
+          status: 403,
+        });
+      }
     }
 
     const query = {
       _id: ticketId,
-      companyId,
+      companyId: { $in: [companyId, companyId.toHexString()] },
     };
 
     if (role === "customer") {
@@ -781,9 +843,13 @@ module.exports = function createCommonRoutes({
       );
     }
 
-    const allowedStatuses = write
-      ? ["assigned", "in_progress"]
-      : ["assigned", "in_progress", "resolved", "closed"];
+    const allowedStatuses = isLeadership
+      ? write
+        ? ["open", "assigned", "in_progress"]
+        : ["open", "assigned", "in_progress", "resolved", "closed"]
+      : write
+        ? ["assigned", "in_progress"]
+        : ["assigned", "in_progress", "resolved", "closed"];
 
     if (!allowedStatuses.includes(ticket.status)) {
       throw Object.assign(
@@ -796,7 +862,7 @@ module.exports = function createCommonRoutes({
       );
     }
 
-    if (write && !ticket.currentAgent?.uid) {
+    if (write && !isLeadership && !ticket.currentAgent?.uid) {
       throw Object.assign(
         new Error("An assigned agent is required to send messages"),
         { status: 409 },
@@ -805,11 +871,12 @@ module.exports = function createCommonRoutes({
 
     return {
       user,
-      role,
+      role, // Keeps exact role: "customer" | "agent" | "manager" | "owner"
       ticket,
       companyId,
     };
   };
+
 
   // =====================================================
   // 6. READ SUPPORT CONVERSATION
@@ -902,7 +969,7 @@ module.exports = function createCommonRoutes({
         const ticketId = new ObjectId(req.params.ticketId);
         let savedMessage;
 
-        await session.withTransaction(
+       await session.withTransaction(
           async () => {
             const { user, role, ticket, companyId } =
               await checkConversationAccess({
@@ -920,15 +987,14 @@ module.exports = function createCommonRoutes({
 
             const filter = {
               _id: ticket._id,
-              companyId,
+              companyId: { $in: [companyId, companyId.toHexString()] },
               status: ticket.status,
               aiResolved: { $ne: true },
-              "currentAgent.uid": ticket.currentAgent.uid,
             };
 
             if (role === "customer") {
               filter.uid = user.uid;
-            } else {
+            } else if (role === "agent") {
               filter["currentAgent.uid"] = user.uid;
             }
 
@@ -970,7 +1036,7 @@ module.exports = function createCommonRoutes({
 
               sender: {
                 uid: user.uid,
-                role,
+                role, // "customer" | "agent" | "manager" | "owner"
                 displayName:
                   user.displayName || user.name || user.email || "User",
                 email: user.email || null,
@@ -987,42 +1053,80 @@ module.exports = function createCommonRoutes({
 
             await supportConversations.insertOne(savedMessage, { session });
 
-            const fromAgent = role === "agent";
+            if (role === "manager" || role === "owner") {
+              const roleLabel = role === "owner" ? "Owner" : "Manager";
 
-            const recipientUid = fromAgent
-              ? ticket.uid
-              : ticket.currentAgent.uid;
+              const targets = [
+                {
+                  uid: ticket.uid,
+                  path: `/customer/tickets/${ticket._id}`,
+                  title: `New ${roleLabel} Reply`,
+                  msg: `A company ${role} replied on ticket ${ticket.ticketNumber}.`,
+                },
+                ...(ticket.currentAgent?.uid
+                  ? [
+                      {
+                        uid: ticket.currentAgent.uid,
+                        path: `/agent/tickets/${ticket._id}`,
+                        title: `${roleLabel} Joined Conversation`,
+                        msg: `A company ${role} replied on ticket ${ticket.ticketNumber}.`,
+                      },
+                    ]
+                  : []),
+              ].filter((t) => t.uid && t.uid !== user.uid);
 
-            if (typeof recipientUid !== "string" || !recipientUid.trim()) {
-              throw Object.assign(
-                new Error("Ticket recipient information is invalid"),
-                { status: 409 },
-              );
-            }
+              for (const target of targets) {
+                await createNotification({
+                  uid: target.uid,
+                  companyId,
+                  title: target.title,
+                  message: target.msg,
+                  type: "agent_reply",
+                  ticketId: ticket._id,
+                  ticketNumber: ticket.ticketNumber,
+                  messageId,
+                  path: target.path,
+                  session,
+                });
+              }
+            } else {
+              const fromAgent = role === "agent";
 
-            if (recipientUid !== user.uid) {
-              await createNotification({
-                uid: recipientUid,
-                companyId,
+              const recipientUid = fromAgent
+                ? ticket.uid
+                : ticket.currentAgent.uid;
 
-                title: fromAgent ? "New Support Reply" : "New Customer Message",
+              if (typeof recipientUid !== "string" || !recipientUid.trim()) {
+                throw Object.assign(
+                  new Error("Ticket recipient information is invalid"),
+                  { status: 409 },
+                );
+              }
 
-                message: fromAgent
-                  ? `You received a new reply on ticket ${ticket.ticketNumber}.`
-                  : `The customer sent a message on ticket ${ticket.ticketNumber}.`,
+              if (recipientUid !== user.uid) {
+                await createNotification({
+                  uid: recipientUid,
+                  companyId,
 
-                type: fromAgent ? "agent_reply" : "customer_reply",
+                  title: fromAgent ? "New Support Reply" : "New Customer Message",
 
-                ticketId: ticket._id,
-                ticketNumber: ticket.ticketNumber,
-                messageId,
+                  message: fromAgent
+                    ? `You received a new reply on ticket ${ticket.ticketNumber}.`
+                    : `The customer sent a message on ticket ${ticket.ticketNumber}.`,
 
-                path: fromAgent
-                  ? `/customer/tickets/${ticket._id}`
-                  : `/agent/tickets/${ticket._id}`,
+                  type: fromAgent ? "agent_reply" : "customer_reply",
 
-                session,
-              });
+                  ticketId: ticket._id,
+                  ticketNumber: ticket.ticketNumber,
+                  messageId,
+
+                  path: fromAgent
+                    ? `/customer/tickets/${ticket._id}`
+                    : `/agent/tickets/${ticket._id}`,
+
+                  session,
+                });
+              }
             }
           },
           {

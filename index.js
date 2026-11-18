@@ -16,7 +16,7 @@ const {
 const createCommonRoutes = require("./routes/common.routes");
 const createCustomerRoutes = require("./routes/customer/customer.routes");
 const createAgentRoutes = require("./routes/agent/agent.routes");
-// const createManagerRoutes = require("./routes/manager/manager.routes");
+const createManagerRoutes = require("./routes/manager/manager.routes");
 // const createPlatformRoutes = require("./routes/platform/platform.routes");
 const createAiRoutes = require("./routes/ai.routes");
 
@@ -151,6 +151,26 @@ async function run() {
     _id: -1,
   });
 
+  await tickets.createIndex({
+    companyId: 1,
+    updatedAt: -1,
+    _id: -1,
+  });
+
+  await users.createIndex({
+    companyId: 1,
+    role: 1,
+    verifyIdAgent: 1,
+    createdAt: 1,
+  });
+
+  await notifications.createIndex({
+    uid: 1,
+    companyId: 1,
+    createdAt: -1,
+    _id: -1,
+  });
+
   // =====================================================
   // HOME
   // =====================================================
@@ -218,16 +238,18 @@ async function run() {
   // MANAGER ROUTES
   // =====================================================
 
-  // app.use(
-  //   "/",
-  //   createManagerRoutes({
-  //     users,
-  //     companies,
-  //     tickets,
-  //     verifyFirebaseToken,
-  //     createNotification,
-  //   }),
-  // );
+app.use(
+  "/",
+  createManagerRoutes({
+     client,
+    users,
+    companies,
+    tickets,
+    notifications,
+    verifyFirebaseToken,
+    createNotification,
+  }),
+);
 
   // =====================================================
   // PLATFORM ADMIN ROUTES
