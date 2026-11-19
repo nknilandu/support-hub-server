@@ -21,7 +21,7 @@ const createOwnerRoutes = require("./routes/owner/owner.routes");
 const createAiRoutes = require("./routes/ai.routes");
 
 const app = express();
-const port = process.env.PORT || 3021;
+const port = process.env.PORT || 3000;
 
 // =====================================================
 // EXPRESS MIDDLEWARE
@@ -103,7 +103,7 @@ const client = new MongoClient(uri, {
 // =====================================================
 
 async function run() {
-  await client.connect();
+  // await client.connect();
 
   const DB = client.db("supportHub");
 
@@ -179,9 +179,90 @@ async function run() {
   // =====================================================
   // HOME
   // =====================================================
+  // =====================================================
+  // HOME
+  // =====================================================
 
   app.get("/", (req, res) => {
-    res.send("SupportHub server is running");
+    res.type("html").send(`
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>SupportHub API</title>
+
+        <style>
+          * {
+            box-sizing: border-box;
+          }
+
+          body {
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: 24px;
+            background: #0f0b14;
+            color: #f472b6;
+            font-family: monospace;
+          }
+
+          main {
+            width: 100%;
+            text-align: center;
+          }
+
+          .banner {
+            overflow-x: auto;
+            padding: 16px 0;
+          }
+
+          pre {
+            display: inline-block;
+            margin: 0;
+            text-align: left;
+            font-size: clamp(8px, 1.5vw, 16px);
+            line-height: 1.3;
+            text-shadow: 0 0 16px #ec489955;
+          }
+
+          p {
+            margin: 24px 0 0;
+            font-size: 14px;
+            letter-spacing: 1px;
+          }
+
+          .status {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            margin-right: 8px;
+            border-radius: 50%;
+            background: #4ade80;
+          }
+        </style>
+      </head>
+
+      <body>
+        <main>
+          <div class="banner">
+            <pre>
+ ____                              _   _   _       _
+/ ___| _   _ _ __  _ __   ___  _ __| |_| | | |_   _| |__
+\\___ \\| | | | '_ \\| '_ \\ / _ \\| '__| __| |_| | | | | '_ \\
+ ___) | |_| | |_) | |_) | (_) | |  | |_|  _  | |_| | |_) |
+|____/ \\__,_| .__/| .__/ \\___/|_|   \\__|_| |_|\\__,_|_.__/
+            |_|   |_|
+            </pre>
+          </div>
+
+        <p style="color: #4ade80;">
+  <span class="status"></span>SupportHub server is running
+</p>  </main>
+      </body>
+    </html>
+  `);
   });
 
   // =====================================================
