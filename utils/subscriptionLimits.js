@@ -115,7 +115,7 @@ async function checkStaffSeatLimit({ companies, users, companyId, role }) {
       ...scope,
       role: "manager",
       status: "active",
-      verifyIdAgent: { $ne: "pending" },
+      verifyIdAgent: { $nin: ["pending", "rejected"] },
     });
     if (activeManagers >= limits.managers) {
       return {

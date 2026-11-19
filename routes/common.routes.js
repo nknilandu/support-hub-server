@@ -14,8 +14,7 @@ module.exports = function createCommonRoutes({
 
   // =====================================================
   // ACTIVE USER
-  // Pending agents can access their own profile/notifications.
-  // Agent work requires a separate approval check.
+  // Pending agents/managers can access their own profile/notifications.
   // =====================================================
 
   const activeUser = async (req, res, next) => {
@@ -48,9 +47,6 @@ module.exports = function createCommonRoutes({
 
   // =====================================================
   // NOTIFICATION CREATOR
-  // Supports:
-  // createNotification({ ..., session })
-  // createNotification({ ... }, session)
   // =====================================================
 
   const createNotification = async (
@@ -138,6 +134,14 @@ module.exports = function createCommonRoutes({
   };
 
   // =====================================================
+  // COMPANY NAME VALIDATION & NORMALIZATION HELPERS
+  // =====================================================
+  const COMPANY_NAME_REGEX = /^[a-zA-Z0-9 _-]+$/;
+
+  const normalizeCompanyKey = (name) =>
+    name.trim().toLowerCase().replace(/\s+/g, "");
+
+  // =====================================================
   // 1. REGISTER USER
   // POST /users
   // =====================================================
@@ -146,7 +150,6 @@ module.exports = function createCommonRoutes({
     try {
       const uid = req.user.uid;
 
-      // Identity comes from Firebase, not the request body.
       const email =
         typeof req.user.email === "string"
           ? req.user.email.trim().toLowerCase()
@@ -159,62 +162,13 @@ module.exports = function createCommonRoutes({
         });
       }
 
-      const existingUser = await users.findOne({ uid });
+      const role = req.body?.role;
 
-      if (existingUser) {
-        return res.send({
-          success: true,
-          message: "User already exists",
-          existing: true,
-          insertedId: existingUser._id,
-        });
-      }
-
-      const role = req.body?.role === "owner" ? "manager" : req.body?.role;
-
-      if (!["customer", "agent", "manager"].includes(role)) {
+      if (!["customer", "agent", "manager", "owner"].includes(role)) {
         return res.status(400).send({
           success: false,
           message: "Invalid registration role",
         });
-      }
-
-      let company = null;
-
-      if (role === "manager") {
-        // Public signup cannot grant management access
-        // to an existing company.
-        if (req.body?.companyId) {
-          return res.status(403).send({
-            success: false,
-            message:
-              "Joining an existing company as a manager requires an invitation",
-          });
-        }
-      } else {
-        const companyId = req.body?.companyId;
-
-        if (
-          typeof companyId !== "string" ||
-          !/^[a-f\d]{24}$/i.test(companyId)
-        ) {
-          return res.status(400).send({
-            success: false,
-            message: "A valid company ID is required",
-          });
-        }
-
-        company = await companies.findOne({
-          _id: new ObjectId(companyId),
-          status: "active",
-        });
-
-        if (!company) {
-          return res.status(400).send({
-            success: false,
-            message: "Selected company is unavailable",
-          });
-        }
       }
 
       const displayName =
@@ -245,6 +199,104 @@ module.exports = function createCommonRoutes({
         });
       }
 
+      const existingUser = await users.findOne({ uid });
+
+      if (existingUser) {
+        // If a race condition created a default customer without a company during Google signup,
+        // allow completing the intended registration role once.
+        if (
+          !existingUser.companyId &&
+          existingUser.role === "customer" &&
+          role !== "customer"
+        ) {
+          let targetCompany = null;
+
+          if (role !== "owner") {
+            const companyId = req.body?.companyId;
+            if (
+              typeof companyId !== "string" ||
+              !/^[a-f\d]{24}$/i.test(companyId)
+            ) {
+              return res.status(400).send({
+                success: false,
+                message: "A valid company ID is required",
+              });
+            }
+
+            targetCompany = await companies.findOne({
+              _id: new ObjectId(companyId),
+              status: "active",
+            });
+
+            if (!targetCompany) {
+              return res.status(400).send({
+                success: false,
+                message: "Selected company is unavailable",
+              });
+            }
+          }
+
+          await users.updateOne(
+            { _id: existingUser._id },
+            {
+              $set: {
+                role,
+                displayName,
+                photoURL: photoURL || existingUser.photoURL || null,
+                verifyIdAgent: ["agent", "manager"].includes(role)
+                  ? "pending"
+                  : "approved",
+                companyId: targetCompany ? String(targetCompany._id) : null,
+                companyName: targetCompany?.companyName || null,
+                updatedAt: new Date(),
+              },
+            },
+          );
+        }
+
+        return res.send({
+          success: true,
+          message: "User ready",
+          existing: true,
+          insertedId: existingUser._id,
+        });
+      }
+
+      let company = null;
+
+      if (role === "owner") {
+        if (req.body?.companyId) {
+          return res.status(403).send({
+            success: false,
+            message: "Owner must create a new workspace company",
+          });
+        }
+      } else {
+        const companyId = req.body?.companyId;
+
+        if (
+          typeof companyId !== "string" ||
+          !/^[a-f\d]{24}$/i.test(companyId)
+        ) {
+          return res.status(400).send({
+            success: false,
+            message: "A valid company ID is required",
+          });
+        }
+
+        company = await companies.findOne({
+          _id: new ObjectId(companyId),
+          status: "active",
+        });
+
+        if (!company) {
+          return res.status(400).send({
+            success: false,
+            message: "Selected company is unavailable",
+          });
+        }
+      }
+
       const now = new Date();
 
       const user = {
@@ -255,7 +307,10 @@ module.exports = function createCommonRoutes({
         role,
         status: "active",
 
-        verifyIdAgent: role === "agent" ? "pending" : "approved",
+        // Both agent and manager require approval after registration
+        verifyIdAgent: ["agent", "manager"].includes(role)
+          ? "pending"
+          : "approved",
 
         companyId: company ? String(company._id) : null,
         companyName: company?.companyName || null,
@@ -264,8 +319,6 @@ module.exports = function createCommonRoutes({
         updatedAt: now,
       };
 
-      // Repeat registration must not overwrite
-      // role, company or approval.
       const result = await users.updateOne(
         { uid },
         { $setOnInsert: user },
@@ -315,9 +368,8 @@ module.exports = function createCommonRoutes({
   });
 
   // =====================================================
-  // 2. CREATE MANAGER'S COMPANY
+  // 2. CREATE OWNER'S COMPANY
   // POST /companies
-  // Company names are unique across all statuses.
   // =====================================================
 
   router.post(
@@ -328,19 +380,36 @@ module.exports = function createCommonRoutes({
       if (!["manager", "owner"].includes(req.currentUser.role)) {
         return res.status(403).send({
           success: false,
-          message: "Only a workplace manager can create a company",
+          message: "Only a company owner can create a company",
         });
       }
 
-      const companyName =
+      const rawCompanyName =
         typeof req.body?.companyName === "string"
-          ? req.body.companyName.trim().toLowerCase()
+          ? req.body.companyName.trim().replace(/\s+/g, " ")
           : "";
 
-      if (!companyName || companyName.length > 200) {
+      if (!rawCompanyName || rawCompanyName.length > 200) {
         return res.status(400).send({
           success: false,
           message: "Company name must contain 1 to 200 characters",
+        });
+      }
+
+      if (!COMPANY_NAME_REGEX.test(rawCompanyName)) {
+        return res.status(400).send({
+          success: false,
+          message:
+            "Company name can only contain letters, numbers, spaces, underscores (_), and hyphens (-)",
+        });
+      }
+
+      const normalizedCompanyName = normalizeCompanyKey(rawCompanyName);
+
+      if (!normalizedCompanyName) {
+        return res.status(400).send({
+          success: false,
+          message: "Company name cannot be only spaces",
         });
       }
 
@@ -373,12 +442,11 @@ module.exports = function createCommonRoutes({
             user.status !== "active" ||
             !["manager", "owner"].includes(user.role)
           ) {
-            throw Object.assign(new Error("Active manager access required"), {
+            throw Object.assign(new Error("Active owner access required"), {
               status: 403,
             });
           }
 
-          // Repeated requests return the existing company.
           if (user.companyId) {
             if (!ObjectId.isValid(user.companyId)) {
               throw Object.assign(
@@ -399,13 +467,12 @@ module.exports = function createCommonRoutes({
               );
             }
           } else {
-            // Compatibility with older company records.
             const existingCompanies = await companies
               .find(
                 {
                   $or: [
-                    { primaryManagerUid: user.uid },
                     { ownerUid: user.uid },
+                    { primaryManagerUid: user.uid },
                   ],
                 },
                 { session },
@@ -432,17 +499,28 @@ module.exports = function createCommonRoutes({
           const now = new Date();
 
           if (!company) {
-            const duplicate = await companies.findOne(
-              { companyName },
-              {
-                session,
-                collation: {
-                  locale: "en",
-                  strength: 2,
+            const allCompanies = await companies
+              .find(
+                {},
+                {
+                  session,
+                  projection: {
+                    _id: 1,
+                    companyName: 1,
+                    normalizedCompanyName: 1,
+                  },
                 },
-                projection: { _id: 1 },
-              },
-            );
+              )
+              .toArray();
+
+            const duplicate = allCompanies.find((c) => {
+              const existingKey =
+                c.normalizedCompanyName ||
+                (typeof c.companyName === "string"
+                  ? normalizeCompanyKey(c.companyName)
+                  : "");
+              return existingKey === normalizedCompanyName;
+            });
 
             if (duplicate) {
               throw Object.assign(
@@ -453,26 +531,23 @@ module.exports = function createCommonRoutes({
 
             company = {
               _id: new ObjectId(),
-              companyName,
+              companyName: rawCompanyName,
+              normalizedCompanyName,
               companyLogo: companyLogo || null,
 
-              primaryManagerUid: user.uid,
-
-              // Existing-schema compatibility.
               ownerUid: user.uid,
               ownerId: user._id,
+              primaryManagerUid: user.uid,
 
               status: "active",
               createdAt: now,
               updatedAt: now,
             };
 
-            // Unique index protects concurrent requests.
             await companies.insertOne(company, { session });
             created = true;
           }
 
-          // Company creation and user linkage commit together.
           await users.updateOne(
             { _id: user._id },
             {
@@ -496,11 +571,7 @@ module.exports = function createCommonRoutes({
           company,
         });
       } catch (error) {
-        if (
-          error.code === 11000 &&
-          (error.keyPattern?.companyName ||
-            error.message?.includes("unique_company_name"))
-        ) {
+        if (error.code === 11000) {
           return res.status(409).send({
             success: false,
             message: "This company name is already registered",
@@ -517,7 +588,6 @@ module.exports = function createCommonRoutes({
   // =====================================================
   // 3. ACTIVE COMPANIES
   // GET /companies
-  // Public registration dropdown.
   // =====================================================
 
   router.get("/companies", async (req, res, next) => {
@@ -546,7 +616,6 @@ module.exports = function createCommonRoutes({
   // =====================================================
   // 4. CURRENT USER
   // GET /users/me
-  // Inactive users can also read their account status.
   // =====================================================
 
   router.get("/users/me", verifyFirebaseToken, async (req, res, next) => {
@@ -591,7 +660,6 @@ module.exports = function createCommonRoutes({
   // =====================================================
   // 5. UPDATE MY PROFILE
   // PATCH /users/me
-  // No role, company, email, status or approval updates.
   // =====================================================
 
   router.patch(
@@ -677,9 +745,8 @@ module.exports = function createCommonRoutes({
     },
   );
 
-// =====================================================
+  // =====================================================
   // CONVERSATION ACCESS
-  // Supports 4 roles: customer, agent, manager (multiple), owner (multi-company)
   // =====================================================
 
   const checkConversationAccess = async ({
@@ -725,11 +792,17 @@ module.exports = function createCommonRoutes({
       );
     }
 
+    if (role === "manager" && user.verifyIdAgent !== "approved") {
+      throw Object.assign(
+        new Error("Your manager account requires owner approval"),
+        { status: 403 },
+      );
+    }
+
     const isLeadership = role === "manager" || role === "owner";
     let companyId = null;
 
     if (role === "owner") {
-      // Owner can own multiple companies (via company.ownerUid / company.owners / user.companyIds / user.companyId)
       const ticketDoc = await tickets.findOne(
         { _id: ticketId },
         { ...options, projection: { companyId: 1 } },
@@ -742,9 +815,12 @@ module.exports = function createCommonRoutes({
       }
 
       if (!ticketDoc.companyId || !ObjectId.isValid(ticketDoc.companyId)) {
-        throw Object.assign(new Error("Ticket company information is invalid"), {
-          status: 403,
-        });
+        throw Object.assign(
+          new Error("Ticket company information is invalid"),
+          {
+            status: 403,
+          },
+        );
       }
 
       const targetCompanyId = new ObjectId(ticketDoc.companyId);
@@ -788,7 +864,6 @@ module.exports = function createCommonRoutes({
 
       companyId = company._id;
     } else {
-      // customer, agent, and manager belong to their assigned companyId
       if (!user.companyId || !ObjectId.isValid(user.companyId)) {
         throw Object.assign(new Error("Your company information is invalid"), {
           status: 403,
@@ -871,12 +946,11 @@ module.exports = function createCommonRoutes({
 
     return {
       user,
-      role, // Keeps exact role: "customer" | "agent" | "manager" | "owner"
+      role,
       ticket,
       companyId,
     };
   };
-
 
   // =====================================================
   // 6. READ SUPPORT CONVERSATION
@@ -969,7 +1043,7 @@ module.exports = function createCommonRoutes({
         const ticketId = new ObjectId(req.params.ticketId);
         let savedMessage;
 
-       await session.withTransaction(
+        await session.withTransaction(
           async () => {
             const { user, role, ticket, companyId } =
               await checkConversationAccess({
@@ -1036,7 +1110,7 @@ module.exports = function createCommonRoutes({
 
               sender: {
                 uid: user.uid,
-                role, // "customer" | "agent" | "manager" | "owner"
+                role,
                 displayName:
                   user.displayName || user.name || user.email || "User",
                 email: user.email || null,
@@ -1108,7 +1182,9 @@ module.exports = function createCommonRoutes({
                   uid: recipientUid,
                   companyId,
 
-                  title: fromAgent ? "New Support Reply" : "New Customer Message",
+                  title: fromAgent
+                    ? "New Support Reply"
+                    : "New Customer Message",
 
                   message: fromAgent
                     ? `You received a new reply on ticket ${ticket.ticketNumber}.`
@@ -1212,7 +1288,6 @@ module.exports = function createCommonRoutes({
   // =====================================================
   // 9. READ ALL MY NOTIFICATIONS
   // PATCH /notifications/read-all
-  // Keep before /notifications/:id.
   // =====================================================
 
   router.patch(

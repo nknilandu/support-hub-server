@@ -560,7 +560,9 @@ module.exports = function createOwnerRoutes({
       const customers = workspaceUsers.filter((u) => u.role === "customer");
 
       const activeManagersCount = managers.filter(
-        (m) => m.status === "active",
+        (m) =>
+          m.status === "active" &&
+          !["pending", "rejected"].includes(m.verifyIdAgent),
       ).length;
       const activeAgentsCount = agents.filter(
         (a) => a.status === "active" && a.verifyIdAgent === "approved",
@@ -676,14 +678,13 @@ module.exports = function createOwnerRoutes({
         .slice(0, 5)
         .map(formatOverviewTicket);
 
-      const pendingRoleRequests = workspaceUsers
+      const allPendingRequests = workspaceUsers
         .filter(
           (u) =>
             (u.role === "agent" || u.role === "manager") &&
             u.verifyIdAgent === "pending",
         )
         .sort((a, b) => timeOf(a.createdAt) - timeOf(b.createdAt))
-        .slice(0, 5)
         .map((u) => ({
           _id: u._id,
           uid: u.uid,
@@ -693,6 +694,8 @@ module.exports = function createOwnerRoutes({
           status: u.status,
           createdAt: u.createdAt,
         }));
+
+      const pendingRoleRequests = allPendingRequests.slice(0, 5);
 
       return res.send({
         success: true,
@@ -717,7 +720,7 @@ module.exports = function createOwnerRoutes({
           managersCount: activeManagersCount,
           agentsCount: activeAgentsCount,
           customersCount: customers.length,
-          pendingApprovals: pendingRoleRequests.length,
+          pendingApprovals: allPendingRequests.length,
         },
         statusChart,
         resolutionChart,
@@ -1704,7 +1707,7 @@ module.exports = function createOwnerRoutes({
           ...scope,
           role: "manager",
           status: "active",
-          verifyIdAgent: { $ne: "pending" },
+          verifyIdAgent: { $nin: ["pending", "rejected"] },
         }),
         users.countDocuments({
           ...scope,
@@ -1755,6 +1758,10 @@ module.exports = function createOwnerRoutes({
         updates.verifyIdAgent = "approved";
         message = `${member.displayName || "Member"}'s role updated to ${role}`;
       } else if (action === "approve") {
+        if (!["manager", "agent"].includes(member.role)) {
+          fail(400, "Only manager or agent accounts require approval");
+        }
+
         if (
           member.role === "manager" &&
           subscription.limits.managers !== null &&
@@ -1788,6 +1795,10 @@ module.exports = function createOwnerRoutes({
         };
         message = `${member.displayName || "Member"} approved as ${member.role}`;
       } else if (action === "reject") {
+        if (!["manager", "agent"].includes(member.role)) {
+          fail(400, "Only manager or agent requests can be rejected");
+        }
+
         const cleanReason = typeof reason === "string" ? reason.trim() : "";
         if (!cleanReason) {
           fail(400, "Please provide a rejection reason");
@@ -1865,7 +1876,7 @@ module.exports = function createOwnerRoutes({
             ...scope,
             role: "manager",
             status: "active",
-            verifyIdAgent: { $ne: "pending" },
+            verifyIdAgent: { $nin: ["pending", "rejected"] },
           }),
           users.countDocuments({
             ...scope,
@@ -1944,7 +1955,7 @@ module.exports = function createOwnerRoutes({
           ...scope,
           role: "manager",
           status: "active",
-          verifyIdAgent: { $ne: "pending" },
+          verifyIdAgent: { $nin: ["pending", "rejected"] },
         }),
         users.countDocuments({
           ...scope,

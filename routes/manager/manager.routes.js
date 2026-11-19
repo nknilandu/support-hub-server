@@ -252,6 +252,11 @@ module.exports = function createManagerRoutes({
       fail(403, "Your account is not active");
     }
 
+    // Manager accounts require owner approval before accessing manager routes
+    if (manager.role === "manager" && manager.verifyIdAgent !== "approved") {
+      fail(403, "Your manager account is pending owner approval");
+    }
+
     if (!manager.companyId || !ObjectId.isValid(manager.companyId)) {
       fail(403, "Your account is not linked to a company");
     }
@@ -980,6 +985,9 @@ module.exports = function createManagerRoutes({
       let notificationSaved = false;
 
       if (typeof createNotification === "function") {
+        const actorRoleLabel =
+          req.manager.role === "owner" ? "company owner" : "manager";
+
         const results = await Promise.allSettled([
           createNotification({
             uid: updatedAgent.uid,
@@ -988,14 +996,14 @@ module.exports = function createManagerRoutes({
             title: message,
             message:
               action === "reject"
-                ? `Your agent application was rejected. Reason: ${reason}`
+                ? `Your agent application was rejected by the ${actorRoleLabel}. Reason: ${reason}`
                 : action === "suspend"
-                  ? "Your agent account has been suspended."
+                  ? `Your agent account has been suspended by the ${actorRoleLabel}.`
                   : action === "activate"
-                    ? "Your approved agent account is active again."
+                    ? `Your approved agent account has been activated by the ${actorRoleLabel}.`
                     : reason
-                      ? `Your agent application has been approved. Note: ${reason}`
-                      : "Your agent application has been approved.",
+                      ? `Your agent application has been approved by the ${actorRoleLabel}. Note: ${reason}`
+                      : `Your agent application has been approved by the ${actorRoleLabel}.`,
             type: "general",
             path: "/notifications",
           }),
@@ -1007,7 +1015,8 @@ module.exports = function createManagerRoutes({
             title: message,
             message: `${updatedAgent.displayName || updatedAgent.email || "Agent"}: ${action}.`,
             type: "general",
-            path: "/manager/agents",
+            path:
+              req.manager.role === "owner" ? "/owner/team" : "/manager/agents",
           }),
         ]);
 

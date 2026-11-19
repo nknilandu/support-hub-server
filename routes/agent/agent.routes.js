@@ -201,7 +201,11 @@ module.exports = function createAgentRoutes({
     }
 
     if (agent.verifyIdAgent !== "approved") {
-      return fail(res, 403, "Your agent account requires manager approval");
+      return fail(
+        res,
+        403,
+        "Your agent account requires company owner or manager approval",
+      );
     }
 
     if (!agent.companyId || !ObjectId.isValid(agent.companyId)) {
