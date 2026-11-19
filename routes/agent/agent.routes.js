@@ -1,6 +1,8 @@
 const express = require("express");
 const { ObjectId } = require("mongodb");
 
+const { checkAiReplyLimit } = require("../../utils/subscriptionLimits");
+
 module.exports = function createAgentRoutes({
   users,
   companies,
@@ -1016,6 +1018,16 @@ module.exports = function createAgentRoutes({
           409,
           "AI suggested reply is unavailable for this ticket",
         );
+      }
+
+      const aiLimitCheck = await checkAiReplyLimit({
+        companies,
+        tickets,
+        companyId: req.agentCompanyId,
+      });
+
+      if (!aiLimitCheck.allowed) {
+        return fail(res, 403, aiLimitCheck.message);
       }
 
       const customer = await users.findOne(

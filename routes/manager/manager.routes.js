@@ -1,6 +1,11 @@
 const express = require("express");
 const { ObjectId } = require("mongodb");
 
+const {
+  getEffectiveLimits,
+  checkStaffSeatLimit,
+} = require("../../utils/subscriptionLimits");
+
 module.exports = function createManagerRoutes({
   client,
   users,
@@ -195,14 +200,23 @@ module.exports = function createManagerRoutes({
     status: company.status,
   });
 
-  const getSeats = (approvedCount) => ({
-    used: approvedCount,
-    limit: null,
-    remainingSeats: null,
-    configured: false,
-    limitReached: false,
-    enforced: false,
-  });
+  const getSeats = (activeApprovedCount, company) => {
+    const { limits } = getEffectiveLimits(company);
+    const limit = limits.agents ?? null;
+    const configured = typeof limit === "number";
+    const remainingSeats = configured
+      ? Math.max(0, limit - activeApprovedCount)
+      : null;
+
+    return {
+      used: activeApprovedCount,
+      limit,
+      remainingSeats,
+      configured,
+      limitReached: configured && activeApprovedCount >= limit,
+      enforced: configured,
+    };
+  };
 
   const permissions = (agent) => ({
     canApprove: ["pending", "rejected"].includes(agent.verifyIdAgent),
@@ -252,6 +266,7 @@ module.exports = function createManagerRoutes({
           companyName: 1,
           companyLogo: 1,
           status: 1,
+          subscription: 1,
         },
       },
     );
@@ -588,6 +603,11 @@ module.exports = function createManagerRoutes({
             String(a._id).localeCompare(String(b._id)),
         );
 
+      const activeApprovedCount = approved.filter(
+        (agent) => agent.status === "active",
+      ).length;
+      const seatInfo = getSeats(activeApprovedCount, req.managerCompany);
+
       return res.send({
         success: true,
         company: companyInfo(req.managerCompany),
@@ -616,13 +636,12 @@ module.exports = function createManagerRoutes({
         agentSummary: {
           total: agents.length,
           approved: approved.length,
-          activeApproved: approved.filter((agent) => agent.status === "active")
-            .length,
+          activeApproved: activeApprovedCount,
           pending: pending.length,
           rejected: agents.filter((agent) => agent.verifyIdAgent === "rejected")
             .length,
-          limit: null,
-          remainingSeats: null,
+          limit: seatInfo.limit,
+          remainingSeats: seatInfo.remainingSeats,
         },
 
         customerSummary: {
@@ -634,7 +653,7 @@ module.exports = function createManagerRoutes({
           generatedAt: now,
           timezone: "Asia/Dhaka",
           listLimit: PAGE_SIZE,
-          agentLimitConfigured: false,
+          agentLimitConfigured: seatInfo.configured,
           activityPeriod: {
             from: activityChart[0].day,
             to: activityChart[6].day,
@@ -673,6 +692,11 @@ module.exports = function createManagerRoutes({
       );
 
       const enrichedAgents = buildAgentMetrics(agents, companyTickets);
+
+      const activeApprovedCount = enrichedAgents.filter(
+        (agent) =>
+          agent.verifyIdAgent === "approved" && agent.status === "active",
+      ).length;
 
       const counts = {
         total: enrichedAgents.length,
@@ -727,7 +751,7 @@ module.exports = function createManagerRoutes({
         success: true,
         company: companyInfo(req.managerCompany),
         counts,
-        seats: getSeats(counts.approved),
+        seats: getSeats(activeApprovedCount, req.managerCompany),
         agents: rows,
         pagination,
       });
@@ -843,6 +867,19 @@ module.exports = function createManagerRoutes({
         fail(400, "Invalid agent action");
       }
 
+      if (action === "approve" || action === "activate") {
+        const seatCheck = await checkStaffSeatLimit({
+          companies,
+          users,
+          companyId: req.managerCompanyId,
+          role: "agent",
+        });
+
+        if (!seatCheck.allowed) {
+          fail(409, seatCheck.message);
+        }
+      }
+
       if (body.reason != null && typeof body.reason !== "string") {
         fail(400, "Reason must be a string");
       }
@@ -887,6 +924,7 @@ module.exports = function createManagerRoutes({
       if (action === "approve") {
         updateFilter.verifyIdAgent = { $in: ["pending", "rejected"] };
         changes.verifyIdAgent = "approved";
+        changes.status = "active";
         changes.rejectionReason = "";
         changes.approvedReason = reason;
         changes.approvedAt = now;

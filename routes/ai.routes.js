@@ -1,10 +1,13 @@
 const express = require("express");
 const { ObjectId } = require("mongodb");
 
+const { checkAiReplyLimit } = require("../utils/subscriptionLimits");
+
 module.exports = function createAiRoutes({
   client,
   users,
   companies,
+  tickets,
   aiConversations,
   aiMessages,
   verifyFirebaseToken,
@@ -91,6 +94,18 @@ module.exports = function createAiRoutes({
             .send({ success: false, message: "Description is required" });
         }
 
+        const aiLimitCheck = await checkAiReplyLimit({
+          companies,
+          tickets,
+          companyId: req.currentUser.companyId,
+        });
+
+        if (!aiLimitCheck.allowed) {
+          return res
+            .status(403)
+            .send({ success: false, message: aiLimitCheck.message });
+        }
+
         const data = await analyzeTicket({ description });
 
         return res.send({
@@ -125,7 +140,20 @@ module.exports = function createAiRoutes({
             .send({ success: false, message: "Message is required" });
         }
 
+        const aiLimitCheck = await checkAiReplyLimit({
+          companies,
+          tickets,
+          companyId: req.currentUser.companyId,
+        });
+
+        if (!aiLimitCheck.allowed) {
+          return res
+            .status(403)
+            .send({ success: false, message: aiLimitCheck.message });
+        }
+
         const uid = req.user.uid;
+
         const requestedId = req.body?.conversationId;
         let conversation = null;
 

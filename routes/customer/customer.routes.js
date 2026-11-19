@@ -2,6 +2,11 @@ const express = require("express");
 const crypto = require("crypto");
 const { ObjectId } = require("mongodb");
 
+const {
+  checkTicketCreationLimit,
+  checkAiReplyLimit,
+} = require("../../utils/subscriptionLimits");
+
 module.exports = function createCustomerRoutes({
   users,
   companies,
@@ -238,8 +243,31 @@ module.exports = function createCustomerRoutes({
         return fail(res, 400, "Invalid resolution type");
       }
 
+      const ticketLimitCheck = await checkTicketCreationLimit({
+        companies,
+        tickets,
+        companyId: req.customerCompanyId,
+      });
+
+      if (!ticketLimitCheck.allowed) {
+        return fail(res, 403, ticketLimitCheck.message);
+      }
+
       const now = new Date();
       const isAiResolved = resolutionType === "ai";
+
+      if (isAiResolved) {
+        const aiLimitCheck = await checkAiReplyLimit({
+          companies,
+          tickets,
+          companyId: req.customerCompanyId,
+        });
+
+        if (!aiLimitCheck.allowed) {
+          return fail(res, 403, aiLimitCheck.message);
+        }
+      }
+
       const ticketNumber = generateTicketNumber();
 
       const ticket = {

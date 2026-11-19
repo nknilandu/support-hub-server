@@ -17,7 +17,7 @@ const createCommonRoutes = require("./routes/common.routes");
 const createCustomerRoutes = require("./routes/customer/customer.routes");
 const createAgentRoutes = require("./routes/agent/agent.routes");
 const createManagerRoutes = require("./routes/manager/manager.routes");
-// const createPlatformRoutes = require("./routes/platform/platform.routes");
+const createOwnerRoutes = require("./routes/owner/owner.routes");
 const createAiRoutes = require("./routes/ai.routes");
 
 const app = express();
@@ -113,6 +113,8 @@ async function run() {
   const supportConversations = DB.collection("supportConversations");
   const aiConversations = DB.collection("aiConversations");
   const aiMessages = DB.collection("aiMessages");
+
+  const invoices = DB.collection("invoices");
 
   // =====================================================
   // INDEXES
@@ -238,44 +240,47 @@ async function run() {
   // MANAGER ROUTES
   // =====================================================
 
-app.use(
-  "/",
-  createManagerRoutes({
-     client,
-    users,
-    companies,
-    tickets,
-    notifications,
-    verifyFirebaseToken,
-    createNotification,
-  }),
-);
+  app.use(
+    "/",
+    createManagerRoutes({
+      client,
+      users,
+      companies,
+      tickets,
+      notifications,
+      verifyFirebaseToken,
+      createNotification,
+    }),
+  );
 
   // =====================================================
-  // PLATFORM ADMIN ROUTES
+  // OWNER ROUTES
   // =====================================================
 
-  // app.use(
-  //   "/",
-  //   createPlatformRoutes({
-  //     users,
-  //     companies,
-  //     tickets,
-  //     verifyFirebaseToken,
-  //     createNotification,
-  //   }),
-  // );
+  app.use(
+    "/",
+    createOwnerRoutes({
+      client,
+      users,
+      companies,
+      tickets,
+      notifications,
+      invoices,
+      verifyFirebaseToken,
+      createNotification,
+    }),
+  );
 
   // =====================================================
   // AI ROUTES
   // =====================================================
 
   app.use(
-    "/",
     createAiRoutes({
       client,
       users,
       companies,
+      tickets,
       aiConversations,
       aiMessages,
       verifyFirebaseToken,
